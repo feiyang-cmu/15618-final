@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Accelerating MoE Token Routing and Dispatch on GPU | 15 618 Project</title>
+<title>Accelerating MoE Token Routing and Dispatch on GPU | 15-618 Project</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=Source+Sans+3:wght@400;600&family=Source+Code+Pro:wght@400;500&display=swap');
-  :root{--text:#1a1a1a;--muted:#555;--light:#888;--border:#ddd;--bg:#fff;--bg2:#f7f7f5;--accent:#1a5fb4;--accent-bg:#eef3fb;--green:#2a7d3f;--green-bg:#edf7ef;--amber:#8a6500;--amber-bg:#fdf6e3;--max-w:720px}
+  :root{--text:#1a1a1a;--muted:#555;--light:#888;--border:#ddd;--bg:#fff;--bg2:#f7f7f5;--accent:#1a5fb4;--accent-bg:#eef3fb;--green:#2a7d3f;--green-bg:#edf7ef;--amber:#8a6500;--amber-bg:#fdf6e3;--max-w:740px}
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:'Source Sans 3',-apple-system,sans-serif;color:var(--text);background:var(--bg);line-height:1.75;font-size:16px;padding:2rem 1.5rem 4rem}
   .container{max-width:var(--max-w);margin:0 auto}
@@ -15,6 +15,7 @@
   h2{font-family:'Source Serif 4',Georgia,serif;font-size:1.25rem;font-weight:600;margin-top:2.5rem;margin-bottom:0.75rem}
   p{margin-bottom:1rem}
   strong{font-weight:600}
+  em{font-style:italic}
   code{font-family:'Source Code Pro',monospace;font-size:0.88em;background:var(--bg2);padding:0.15em 0.4em;border-radius:3px}
   .callout{padding:1rem 1.25rem;border-radius:6px;margin:1rem 0 1.5rem;font-size:0.95rem;line-height:1.7}
   .callout-blue{background:var(--accent-bg);border-left:3px solid var(--accent)}
@@ -30,6 +31,9 @@
   a:hover{text-decoration:underline}
   .nav{margin-bottom:2rem;font-size:0.85rem;color:var(--light)}
   .nav a{margin-right:1.5rem}
+  .fig{margin:1.5rem 0;text-align:center}
+  .fig svg{max-width:100%;height:auto}
+  .fig-caption{font-size:0.85rem;color:var(--muted);margin-top:0.5rem}
   .schedule-grid{display:grid;grid-template-columns:80px 1fr;gap:0;margin:1rem 0;font-size:0.93rem}
   .schedule-grid .week{font-weight:600;color:var(--accent);padding:0.6rem 0;border-bottom:1px solid var(--border);font-size:0.85rem}
   .schedule-grid .task{padding:0.6rem 0 0.6rem 1rem;border-bottom:1px solid var(--border);color:var(--muted);line-height:1.6}
@@ -47,53 +51,109 @@
 <h1>Accelerating MoE Token Routing and Dispatch on GPU</h1>
 
 <div class="meta">
-  <strong>Team:</strong> Feiyang Wu(andrew id: feiyang2) and Yuhang Hu(andrew id: yuhangh)<br>
-  <strong>Course:</strong> 15 618 Parallel Computer Architecture and Programming, Spring 2026<br>
-  <strong>URL:</strong> <a href="https://feiyang-cmu.github.io/15618-final/index.html#">https://feiyang cmu.github.io/15618 final/index.html</a>
+  <strong>Team:</strong> Feiyang Wu (feiyang2) and Yuhang Hu (yuhangh)<br>
+  <strong>Course:</strong> 15-618 Parallel Computer Architecture and Programming, Spring 2026<br>
+  <strong>URL:</strong> <a href="https://feiyang-cmu.github.io/15618-final/">https://feiyang-cmu.github.io/15618-final/</a>
 </div>
 
 <h2>Summary</h2>
 <p>
-  Mixture of Experts models need to send tokens to dynamically selected experts before they can do any actual math. This routing process involves an unpredictable scatter step where tokens are packed into continuous memory based on their assigned expert, followed by an all to all communication phase across different GPUs if the model is distributed. Both of these steps are famously tricky to run in parallel because of runtime write conflicts, chaotic memory access patterns, and uneven workload distribution. We want to test and compare several different parallel implementation strategies to speed up this entire dispatch pipeline on NVIDIA GPUs. Our ultimate goal is to significantly beat simple baselines by smartly handling thread synchronization, memory layout, and overlapping communication with compute overhead.
+  Mixture of Experts models route each token to a small subset of expert networks at runtime. Before experts can compute, tokens must be packed into contiguous memory grouped by expert, an irregular scatter whose write pattern is entirely data dependent. On a single GPU, expert computation dominates runtime because each expert's FFN executes as a large matrix multiplication and the experts are processed largely in sequence. Expert Parallelism(EP) distribute different experts to multiple GPUs to parallelize computation across devices, but the packing step does not shrink with more GPUs, and AllToAll communication is added on top. As compute per device drops, packing and communication together become the new bottleneck. We plan to design and compare multiple parallel strategies for the packing and dispatch pipeline, analyze the scaling behavior from one to several GPUs, and characterize the tradeoffs between synchronization cost, memory bandwidth utilization, and communication overhead.
 </p>
 
 <h2>Background</h2>
 <p>
-  In a typical MoE layer, a router network looks at the input tokens and assigns each of them to a subset of available experts. Before the experts can start crunching numbers, we have to physically move the token embeddings into the correct memory locations for their assigned experts. If the experts are split across several GPUs, we also have to execute a network communication step to send the tokens over to the right machines. Once the experts finish their logic, we gather everything in reverse to put the results back together.
+  Modern large language model inference has two phases: prefill, which processes the entire input prompt in one forward pass, and decode, which generates output tokens one at a time. We focus on prefill. During prefill, thousands of tokens pass through each layer simultaneously. In a Mixture of Experts layer, a small router network assigns each of the <em>T</em> tokens to <em>K</em> out of <em>E</em> total experts. Each token's <em>d</em> dimensional embedding must then be placed into a buffer where all tokens for the same expert are contiguous, so that expert FFN computation can proceed as efficient matrix multiplications.
+</p>
+
+<div class="fig">
+  <img src="moe layer.png" style="max-height: 400px; width: auto;" alt="MoE Layer on a single GPU">
+  <div class="fig-caption">Figure 1. Structure of a Mixture of Experts (MoE) layer. The gating network dynamically assigns incoming tokens to a subset of experts.</div>
+</div>
+
+<p>
+  On a single GPU all experts reside in local memory. Expert computation dominates runtime: each expert's FFN is a large matrix multiplication, and because a single expert's GEMM is large enough to nearly saturate the GPU, the experts effectively execute in sequence. The packing step preceding computation is comparatively fast but still involves redundant data movement and unnecessary kernel launches in naive implementations.
 </p>
 <p>
-  Writing a sequential version of this is pretty trivial: you just loop through the routing decisions and copy the embeddings one at a time. But doing it that way is way too slow for real models. The real puzzle is figuring out how to make this fast on GPUs, where you have thousands of threads tripping over each other, accessing memory in completely random ways, and waiting on expensive network transfers.
+  The picture changes when scaling to multiple GPUs. Each device holds a fraction of the experts and only computes its share, so per device compute drops proportionally. But the packing step does not shrink: every GPU must still pack all of its tokens regardless of how many devices participate. AllToAll communication is added on top, and its cost grows with both token count and the number of peers. As compute per device decreases, packing and communication together consume a growing share of total runtime. If communication is not overlapped with computation, the GPU sits idle during transfer and scaling falls well short of linear. This shift in the bottleneck from compute to packing and communication is the core motivation for our optimization work.
+</p>
+
+<div class="fig">
+  <img src="all2all pattern.png" style="max-height: 400px; width: auto;" alt="AllToAll communication pattern across multiple GPUs">
+  <div class="fig-caption">Figure 2. AllToAll communication pattern in multi-GPU MoE dispatch. Cross-device token transfer becomes the new bottleneck as expert compute drops per device.</div>
+</div>
+
+<p>
+  A sequential implementation of packing is trivial: iterate over all assignments, maintain a per expert write pointer, copy each embedding to the next slot. This is correct but entirely serial. We focus our effort on parallelizing this step and on overlapping communication with computation when scaling beyond a single device.
 </p>
 
 <h2>The Challenge</h2>
 <p>
-  <strong>Write conflicts:</strong> When thousands of threads are packing tokens at the exact same time, threads that happen to target the same expert will inevitably fight to write to the exact same memory addresses. Since the router changes its mind on every forward pass, we cannot rely on any predetermined writing schedule.
+  In dense Transformer models, the FFN processes all tokens through identical weight matrices, resulting in regular, coalesced memory access patterns that map naturally to GPU execution. MoE introduces a token packing step between routing and expert computation that breaks this regularity in several ways.
 </p>
 <p>
-  <strong>Irregular memory access:</strong> After the routing step, neighboring threads usually need to send data to completely different experts, which means they write to memory locations that are far away from each other. This breaks GPU memory coalescing and basically tanks memory bandwidth. Trying to organize the data first, like grouping things by sorting, adds expensive synchronization barriers and extra data movement. Finding the right balance between clean memory access and low coordination overhead is tough.
+  <strong>Write conflicts.</strong> When thousands of threads simultaneously pack tokens, multiple threads targeting the same expert compete for write positions in the same memory region. The conflict pattern is determined at runtime by the router and changes every forward pass. No static schedule can resolve these conflicts ahead of time.
 </p>
 <p>
-  <strong>Handling load imbalance:</strong> Some experts naturally get more tokens than others depending on the input text. Whatever method we use to divide up the parallel work needs to handle this uneven distribution on the fly so we never end up with idle GPU cores just waiting around.
+  <strong>Irregular memory access.</strong> After routing, adjacent threads in a warp typically target different experts, writing to distant memory regions. This destroys GPU memory coalescing. Sorting tokens by expert restores regularity but requires multiple passes over the full dataset, each involving a complete round trip through HBM. There is a fundamental tension between clean memory access and the cost of achieving it.
 </p>
 <p>
-  <strong>Sending data across GPUs:</strong> Moving tokens around in a distributed cluster is messy because each GPU sends a random amount of data to every other GPU. If we run this normally, the GPU just sits there doing nothing while it waits for the data transfer to finish. To get acceptable performance, we need to hide this delay by pipelining the work and overlapping it with actual computation.
+  <strong>Load imbalance.</strong> Expert popularity depends on the input and is not perfectly uniform. Some experts receive substantially more tokens than others. Any parallel partitioning scheme must handle this runtime imbalance so that GPU resources are not left idle.
 </p>
 <p>
-  <strong>Choosing the right synchronization level:</strong> There are fundamentally different ways to tackle these write collisions. We could run a global sort, use atomic operations on every thread, coordinate at the warp level, or even skip the packing step entirely. Every option makes a drastically different tradeoff between moving data, syncing threads, and keeping the downstream math fast. The best choice ultimately depends on the specific workload numbers and the underlying GPU architecture. Exploring this landscape is what this project is all about.
+  <strong>Communication scaling.</strong> When experts are distributed across GPUs, the AllToAll dispatch is an irregular collective where each GPU sends a different number of tokens to each peer, determined only at runtime. The GPU is completely idle during a synchronous AllToAll. Overlapping this communication with computation requires splitting work into chunks, managing dependencies between chunks with CUDA streams and events, and carefully balancing chunk sizes so that neither the compute nor the communication side starves.
 </p>
+<p>
+  <strong>Synchronization granularity tradeoff.</strong> There are fundamentally different ways to resolve write conflicts. Global sorting eliminates conflicts but requires multiple data passes. Per thread atomics are single pass but serialize under contention. Warp level coordination using SIMD intrinsics avoids both problems but requires shared memory orchestration and synchronization barriers. A fourth option is to skip packing entirely and perform scattered reads during expert computation, trading packing cost for irregular GEMM access. Each approach sits at a different point on the parallelism versus synchronization spectrum. The optimal choice depends on workload parameters such as the number of experts, tokens, and the skew of the routing distribution. Mapping this tradeoff space is the central goal of this project.
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 700 170" xmlns="http://www.w3.org/2000/svg" style="font-family:'Source Sans 3',sans-serif">
+  <defs>
+    <linearGradient id="spectrum" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#eef3fb"/>
+      <stop offset="100%" stop-color="#fce4e4"/>
+    </linearGradient>
+  </defs>
+  <rect x="60" y="50" width="580" height="28" rx="4" fill="url(#spectrum)" stroke="#ccc" stroke-width="0.5"/>
+
+  <text x="60" y="42" font-size="10" fill="#1a5fb4" font-weight="600">More data movement</text>
+  <text x="640" y="42" font-size="10" fill="#a03030" font-weight="600" text-anchor="end">More contention / irregularity</text>
+
+  <circle cx="110" cy="64" r="6" fill="#1a5fb4"/>
+  <text x="110" y="100" text-anchor="middle" font-size="11" fill="#1a5fb4" font-weight="600">Global sort</text>
+  <text x="110" y="114" text-anchor="middle" font-size="10" fill="#555">multi pass, conflict free</text>
+
+  <circle cx="280" cy="64" r="6" fill="#5a3d8a"/>
+  <text x="280" y="100" text-anchor="middle" font-size="11" fill="#5a3d8a" font-weight="600">Warp cooperative</text>
+  <text x="280" y="114" text-anchor="middle" font-size="10" fill="#555">SIMD scan, single pass</text>
+
+  <circle cx="440" cy="64" r="6" fill="#c06000"/>
+  <text x="440" y="100" text-anchor="middle" font-size="11" fill="#c06000" font-weight="600">Atomic scatter</text>
+  <text x="440" y="114" text-anchor="middle" font-size="10" fill="#555">no sorting, contention prone</text>
+
+  <circle cx="590" cy="64" r="6" fill="#a03030"/>
+  <text x="590" y="100" text-anchor="middle" font-size="11" fill="#a03030" font-weight="600">No packing</text>
+  <text x="590" y="114" text-anchor="middle" font-size="10" fill="#555">scattered GEMM directly</text>
+
+  <text x="350" y="155" text-anchor="middle" font-size="11" fill="#888">synchronization vs. downstream efficiency tradeoff</text>
+</svg>
+<div class="fig-caption">Figure 3. The design space for parallel token dispatch. Moving left improves memory regularity for expert compute at the cost of more upfront data movement. Moving right reduces packing overhead but makes expert computation less efficient.</div>
+</div>
 
 <h2>Resources</h2>
 <ul>
-  <li><strong>Hardware:</strong> GHC cluster NVIDIA GPUs. PSC machines if multi GPU access is securely available.</li>
-  <li><strong>Software:</strong> CUDA C++, CUB library, cuBLAS. NVIDIA Nsight Compute and Nsight Systems for deep profiling.</li>
-  <li><strong>Starting point:</strong> All core kernel implementations will be built entirely from scratch. We will study the following open source implementations for design reference:
+  <li><strong>Hardware:</strong> GHC cluster NVIDIA GPUs for single device work. PSC machines if multi GPU access is available.</li>
+  <li><strong>Software:</strong> CUDA C++, CUB library, cuBLAS. NVIDIA Nsight Compute and Nsight Systems for profiling.</li>
+  <li><strong>Starting point:</strong> All core kernel implementations will be written from scratch. We will study the following open source projects for design reference:
     <ul>
-      <li><a href="https://github.com/shawntan/scattermoe">ScatterMoE</a> scatter gather approach that entirely avoids explicit packing</li>
-      <li><a href="https://github.com/databricks/megablocks">MegaBlocks</a> block sparse GEMM reformulation of expert computation</li>
-      <li><a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a> high performance communication library for expert parallelism</li>
-      <li>SGLang / vLLM production MoE routing kernels using sort based dispatch algorithms</li>
+      <li><a href="https://github.com/shawntan/scattermoe">ScatterMoE</a> — scatter/gather approach that avoids explicit packing</li>
+      <li><a href="https://github.com/databricks/megablocks">MegaBlocks</a> — block sparse GEMM reformulation of expert computation</li>
+      <li><a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a> — high performance AllToAll kernels for expert parallelism</li>
+      <li>SGLang / vLLM — production MoE routing kernels using sort based dispatch</li>
     </ul>
   </li>
+  <li><strong>References:</strong> Shazeer et al., "Outrageously Large Neural Networks: The Sparsely Gated Mixture of Experts Layer," ICLR 2017. NVIDIA CUDA C++ Programming Guide.</li>
 </ul>
 
 <h2>Goals and Deliverables</h2>
@@ -101,52 +161,55 @@
 <div class="callout callout-green">
   <div class="callout-label">Plan to achieve</div>
   <ul>
-    <li>A solid sequential CPU baseline and a basic parallel GPU baseline for the core token packing step</li>
-    <li>Several parallel strategies taking fundamentally different approaches to handling memory, collisions, and synchronization</li>
-    <li>Performance benchmarking across a large variety of realistic MoE sizing configurations</li>
-    <li>An end to end single GPU layer benchmark completely covering routing, packing, and expert computation</li>
-    <li>A detailed analysis of tradeoffs showing precisely when and why each strategy performs the best</li>
+    <li>A sequential CPU baseline and a naive parallel GPU baseline for the token packing problem</li>
+    <li>Multiple parallel packing strategies with fundamentally different approaches to conflict resolution, memory access, and synchronization</li>
+    <li>Performance comparison across realistic MoE configurations varying the number of experts, tokens per batch, top K, and routing skew</li>
+    <li>Microarchitectural profiling with Nsight Compute: HBM traffic, atomic contention, shared memory bank conflicts, achieved bandwidth versus roofline</li>
+    <li>An end to end single GPU MoE layer benchmark covering routing, packing, and expert GEMM</li>
+    <li>Analysis of when and why each parallel strategy wins, with quantitative explanation grounded in hardware characteristics</li>
   </ul>
+  <p><strong>Quantitative targets:</strong> 10 to 20x speedup over sequential baseline. 2 to 4x speedup over the naive parallel baseline for models with a small number of experts. Best strategy achieves at least 70 percent of peak HBM bandwidth on the scatter operation.</p>
 </div>
 
 <div class="callout callout-blue">
   <div class="callout-label">Hope to achieve</div>
   <ul>
-    <li>Distributed dispatch using NCCL alongside clean pipeline overlap via CUDA streams</li>
-    <li>A highly parallel CPU implementation utilizing OpenMP and MPI for complete cross platform comparison</li>
-    <li>A heavily fused single kernel routing implementation to eliminate all intermediate memory materialization steps</li>
+    <li>Multi GPU scaling with AllToAll dispatch via NCCL, including pipeline overlap of packing, communication, and expert computation using CUDA streams</li>
+    <li>Scaling analysis from 1 to 4 GPUs showing how communication overhead limits speedup and how pipelining recovers it</li>
+    <li>CPU parallel implementation with OpenMP and SIMD for cross platform bottleneck comparison</li>
+    <li>A fused single kernel that performs routing decisions and packing in one launch, eliminating all intermediate memory materialization</li>
   </ul>
 </div>
 
 <div class="callout callout-amber">
   <div class="callout-label">If things go slowly</div>
   <ul>
-    <li>Focus on deeply optimizing two main strategies instead of branching out into three or more</li>
-    <li>Reduce the entire parameter testing sweep and potentially drop the full layer benchmark portion</li>
+    <li>Focus on two strategies instead of three or more</li>
+    <li>Reduce the parameter sweep and drop the end to end layer benchmark in favor of isolated scatter kernel analysis</li>
   </ul>
 </div>
 
 <h2>Platform Choice</h2>
 <p>
-  NVIDIA GPU clusters and modern CPU environments.
+  NVIDIA GPU is the natural platform for this workload. MoE inference runs on GPU in production, and the token packing problem directly exercises GPU specific parallel challenges: warp level SIMD coordination, shared memory bank conflicts, memory coalescing sensitivity, and atomic contention under skewed access patterns. We use CUDA C++ rather than higher level frameworks like Triton because we need explicit control over shared memory layout, warp intrinsics, and synchronization primitives to implement and meaningfully compare our strategies. The workload is memory bandwidth bound, and modern GPUs provide 1 to 3 TB/s of HBM bandwidth, making this the platform where optimization of irregular scatter has the greatest impact. If multi GPU hardware is available, we will additionally use NCCL for AllToAll communication, which exercises a different axis of parallel systems design: overlapping network transfers with on device computation using asynchronous streams.
 </p>
 
 <h2>Schedule</h2>
 <div class="schedule-grid">
   <div class="week">Week 1<br>Mar 24 to 30</div>
-  <div class="task">Write the sequential baseline and the naive GPU parallel version. Set up the data generation scripts and profiling tools. Identify the raw bottlenecks in our basic approach.</div>
+  <div class="task">Write the sequential baseline and the naive GPU parallel version. Set up data generation with configurable routing distributions and profiling infrastructure. Profile the naive approach and identify bottlenecks.</div>
 
   <div class="week">Week 2<br>Mar 31 to Apr 6</div>
-  <div class="task">Implement alternative parallel strategies. Thoroughly study the reference literature and code. Make sure everything outputs the exact same results as the sequential version step by step.</div>
+  <div class="task">Implement alternative parallel strategies. Study reference implementations for design ideas. Verify correctness of all strategies against the sequential baseline.</div>
 
   <div class="week">Week 3<br>Apr 7 to 13</div>
-  <div class="task"><em>[Milestone]</em> Get all strategies running cleanly and profiled. Do an initial pass of raw performance numbers. Decide which methods are worth optimizing much further.</div>
+  <div class="task"><em>[Milestone]</em> All strategies running and profiled. Initial performance comparison across the parameter sweep. Decide which approaches to optimize further and which to drop.</div>
 
   <div class="week">Week 4<br>Apr 14 to 20</div>
-  <div class="task">Run the deep optimization pass. Execute the comprehensive parameter sweep. Put together the end to end MoE benchmark. Start working on our reach goals early if we have extra time.</div>
+  <div class="task">Deep optimization pass on the most promising strategies. Full parameter sweep. End to end MoE layer benchmark. If ahead of schedule, begin multi GPU or CPU work.</div>
 
   <div class="week">Week 5<br>Apr 21 to 27</div>
-  <div class="task">Finish the final data analysis, characterize the specific performance tradeoffs, and assemble everything into the final report and poster presentation.</div>
+  <div class="task">Final analysis, scaling characterization, tradeoff summary. Assemble the report and poster.</div>
 </div>
 
 </div>
