@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Parallel Irregular Scatter for MoE Token Routing | 15-618 Project</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=Source+Sans+3:wght@400;600&family=Source+Code+Pro:wght@400;500&display=swap');
+
+  :root {
+    --text: #1a1a1a;
+    --muted: #555;
+    --light: #888;
+    --border: #ddd;
+    --bg: #fff;
+    --bg2: #f7f7f5;
+    --accent: #1a5fb4;
+    --accent-bg: #eef3fb;
+    --green: #2a7d3f;
+    --green-bg: #edf7ef;
+    --amber: #8a6500;
+    --amber-bg: #fdf6e3;
+    --max-w: 720px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Source Sans 3', -apple-system, sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    line-height: 1.75;
+    font-size: 16px;
+    padding: 2rem 1.5rem 4rem;
+  }
+
+  .container { max-width: var(--max-w); margin: 0 auto; }
+
+  h1 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 1.75rem;
+    font-weight: 600;
+    line-height: 1.3;
+    margin-bottom: 0.5rem;
+  }
+
+  .meta {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-bottom: 2rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  h2 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-size: 1.25rem;
+    font-weight: 600;
+    margin-top: 2.5rem;
+    margin-bottom: 0.75rem;
+    color: var(--text);
+  }
+
+  p { margin-bottom: 1rem; }
+
+  strong { font-weight: 600; }
+
+  code {
+    font-family: 'Source Code Pro', monospace;
+    font-size: 0.88em;
+    background: var(--bg2);
+    padding: 0.15em 0.4em;
+    border-radius: 3px;
+  }
+
+  .callout {
+    padding: 1rem 1.25rem;
+    border-radius: 6px;
+    margin: 1rem 0 1.5rem;
+    font-size: 0.95rem;
+    line-height: 1.7;
+  }
+
+  .callout-blue { background: var(--accent-bg); border-left: 3px solid var(--accent); }
+  .callout-green { background: var(--green-bg); border-left: 3px solid var(--green); }
+  .callout-amber { background: var(--amber-bg); border-left: 3px solid var(--amber); }
+
+  .callout-label {
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 0.25rem;
+  }
+
+  .callout-blue .callout-label { color: var(--accent); }
+  .callout-green .callout-label { color: var(--green); }
+  .callout-amber .callout-label { color: var(--amber); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+
+  th, td {
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  th {
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    color: var(--muted);
+  }
+
+  ul, ol {
+    margin: 0.5rem 0 1rem 1.5rem;
+  }
+
+  li { margin-bottom: 0.35rem; }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .nav {
+    margin-bottom: 2rem;
+    font-size: 0.85rem;
+    color: var(--light);
+  }
+
+  .nav a { margin-right: 1.5rem; }
+
+  .schedule-grid {
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 0;
+    margin: 1rem 0;
+    font-size: 0.93rem;
+  }
+
+  .schedule-grid .week {
+    font-weight: 600;
+    color: var(--accent);
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.85rem;
+  }
+
+  .schedule-grid .task {
+    padding: 0.6rem 0 0.6rem 1rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<nav class="nav">
+  <a href="index.html">Proposal</a>
+  <a href="#">Milestone</a>
+  <a href="#">Final Report</a>
+</nav>
+
+<h1>Parallelizing Data-Dependent Irregular Scatter on GPU: Token Routing in Mixture-of-Experts Models</h1>
+
+<div class="meta">
+  <strong>Team:</strong> [Your Name] and [Partner Name]<br>
+  <strong>Course:</strong> 15-618 Parallel Computer Architecture and Programming, Spring 2026
+</div>
+
+<h2>Summary</h2>
+<p>
+  Mixture-of-Experts (MoE) models require routing thousands of tokens to a dynamically-selected subset of expert networks, which reduces to an irregular scatter whose write pattern is determined entirely at runtime. A sequential implementation is straightforward, but parallelizing it is hard: concurrent threads contend for write positions, the scatter destroys memory coalescing, and workload skew across experts creates load imbalance. We develop multiple parallel strategies in CUDA C++ that exploit the problem's structure — small key space, known after a cheap classification step — to resolve these challenges, targeting 10–20× speedup over a sequential baseline and near-peak HBM bandwidth utilization on NVIDIA GPUs.
+</p>
+
+<h2>Background</h2>
+<p>
+  Modern MoE language models (Mixtral, DeepSeek-V3) contain <em>E</em> expert sub-networks per layer but activate only <em>K</em> of them per token. Given <em>T</em> input tokens, a small router network produces a <code>(token_id, expert_id)</code> assignment for each of the <em>T×K</em> activated slots. Before expert computation can proceed, all tokens must be <strong>packed into a contiguous buffer grouped by expert</strong>: all tokens assigned to Expert 0 first, then Expert 1, etc.
+</p>
+<p>
+  Concretely, the problem is: given <em>T×K</em> <code>(token_id, expert_id)</code> pairs where <code>expert_id</code> is determined at runtime, and a <em>T×d</em> embedding matrix, produce a <em>(T×K)×d</em> output buffer where entries are grouped by <code>expert_id</code>, plus metadata recording the permutation. A sequential implementation simply iterates over all <em>T×K</em> pairs, maintains a per-expert write pointer, and copies each token's <em>d</em>-dimensional embedding to the next available slot. This is O(<em>T×K×d</em>) — trivially correct but completely serial.
+</p>
+
+<h2>The Challenge</h2>
+<p>
+  <strong>Write conflicts (the core difficulty):</strong> If we assign each of the <em>T×K</em> entries to a separate thread, multiple threads targeting the same expert must coordinate to obtain unique, non-overlapping write positions. Without coordination, two threads both writing to "Expert 0, next slot" would corrupt data. The conflict pattern is unknown until the router runs and changes every forward pass — fundamentally different from a regular scatter where the destination is a known function of the source index.
+</p>
+<p>
+  <strong>Memory coalescing vs. conflict freedom:</strong> On GPU, adjacent threads in a warp should write to adjacent memory addresses for coalescing. But after routing, adjacent threads likely target different experts (different memory regions), destroying coalescing. Restoring coalescing requires reordering threads, which itself requires synchronization. There is an inherent tension: any reordering step that improves memory access regularity adds synchronization cost.
+</p>
+<p>
+  <strong>Load imbalance:</strong> Expert popularity is not perfectly uniform. If we partition work by expert (one thread block per expert), blocks handling popular experts do more work while others sit idle. If we partition by token (ignoring expert assignment), we get good balance but worse locality. The optimal partitioning depends on the actual routing distribution, which varies at runtime.
+</p>
+<p>
+  <strong>Synchronization granularity trade-off:</strong> Eliminating write conflicts via global sort (radix sort on <code>expert_id</code>) requires multiple passes over the entire data with full HBM round-trips per pass. Eliminating them via per-thread atomics is single-pass but creates contention proportional to expert popularity. Between these extremes lies warp-cooperative coordination using SIMD intrinsics (<code>__ballot_sync</code>, <code>__popc</code>) — but this requires careful shared memory orchestration with bank-conflict avoidance. Each approach sits at a different point on the parallelism-vs-synchronization spectrum, and the best choice depends on workload parameters (<em>E, K, T</em>, skew).
+</p>
+<p>
+  <strong>Large payload per entry:</strong> Each scatter entry carries a <em>d</em>=4096 dimensional embedding (8 KB in bf16). Even a small amount of redundant data movement costs tens of MB of HBM bandwidth. The problem is memory-bound, not compute-bound — the challenge is minimizing total data movement while maintaining parallel correctness.
+</p>
+
+<h2>Resources</h2>
+<ul>
+  <li><strong>Hardware:</strong> GHC cluster NVIDIA GPUs. PSC machines (A100) if available.</li>
+  <li><strong>Software:</strong> CUDA C++ with CUB library (parallel sort, scan, histogram primitives). cuBLAS for expert GEMM in end-to-end benchmarks. NVIDIA Nsight Compute and Nsight Systems for profiling.</li>
+  <li><strong>Starting point:</strong> All kernels written from scratch in CUDA C++. CUB library primitives used as building blocks for Strategy A, and CUDA warp intrinsics for Strategy C.</li>
+  <li><strong>References:</strong> Shazeer et al. "Outrageously Large Neural Networks" (ICLR 2017); NVIDIA CUDA Programming Guide (warp-level primitives, shared memory).</li>
+</ul>
+
+<h2>Goals and Deliverables</h2>
+
+<div class="callout callout-green">
+  <div class="callout-label">Plan to achieve (75%)</div>
+  <p><strong>1. Sequential + naive parallel baselines:</strong> Single-threaded CPU reference implementation and a naive GPU parallelization using CUB RadixSort + separate gather kernel.</p>
+  <p><strong>2. Three parallel GPU strategies:</strong></p>
+  <ul>
+    <li><strong>Strategy A — Sort-first:</strong> Global radix sort on <code>expert_id</code>, then embarrassingly parallel gather. Multi-pass, conflict-free, bandwidth-heavy.</li>
+    <li><strong>Strategy B — Atomic scatter:</strong> Per-thread <code>atomicAdd</code> on per-expert counters for write positions, then direct scatter. Single-pass, maximum contention.</li>
+    <li><strong>Strategy C — Warp-cooperative scan:</strong> <code>__ballot_sync</code> to count per-expert tokens within each warp, block-level prefix scan for offsets, then conflict-free scatter. Single-pass, SIMD-coordinated.</li>
+  </ul>
+  <p><strong>3. Detailed performance analysis:</strong></p>
+  <ul>
+    <li>Speedup vs. sequential baseline: target 10–20×</li>
+    <li>Strategy comparison across parameter sweep: <em>E</em> ∈ {8, 16, 64, 128, 256}, <em>K</em> ∈ {1, 2, 8}, <em>T</em> ∈ {1K, 4K, 16K, 64K}</li>
+    <li>NCU microarchitectural analysis: HBM traffic, SMEM bank conflicts, atomic contention, achieved bandwidth vs. roofline</li>
+    <li>Crossover analysis: at which (<em>E</em>, skew) does each strategy win, and why</li>
+  </ul>
+  <p><strong>4. End-to-end MoE layer benchmark:</strong> Full pipeline — routing + packing + expert GEMM (cuBLAS) — measuring total layer time with each strategy.</p>
+  <p><strong>Quantitative targets:</strong> Best strategy achieves ≥70% of peak HBM bandwidth; 10–20× over sequential; 2–4× over naive CUB RadixSort baseline for <em>E</em> ≤ 64.</p>
+</div>
+
+<div class="callout callout-blue">
+  <div class="callout-label">Hope to achieve</div>
+  <ul>
+    <li>CPU parallel implementation (OpenMP + SIMD) with cross-platform bottleneck comparison (false sharing vs. SMEM atomics)</li>
+    <li>Multi-GPU extension with NCCL AllToAllv + CUDA stream pipeline overlap (if multi-GPU hardware available)</li>
+    <li>Fused single-kernel routing: gate + softmax + topK + packing in one launch, eliminating all intermediate HBM materialization</li>
+  </ul>
+</div>
+
+<div class="callout callout-amber">
+  <div class="callout-label">If things go slowly</div>
+  <ul>
+    <li>Drop Strategy C and focus on A vs. B comparison</li>
+    <li>Drop end-to-end MoE layer benchmark, focus on isolated scatter kernel analysis</li>
+    <li>Reduce parameter sweep to fewer configurations</li>
+  </ul>
+</div>
+
+<h2>Platform Choice</h2>
+<p>
+  NVIDIA GPU is the natural platform for this workload: MoE inference runs on GPU, and the problem exercises GPU-specific parallel challenges — warp-level SIMD coordination (<code>__ballot_sync</code>), shared memory bank conflicts, memory coalescing sensitivity, and atomic contention scaling. CUDA C++ (rather than higher-level frameworks) gives explicit control over these mechanisms, which is essential for both implementing Strategy C and understanding performance through profiling. The problem is memory-bandwidth-bound, and modern GPUs offer 1–3 TB/s HBM bandwidth — the platform where scatter performance matters most.
+</p>
+
+<h2>Schedule</h2>
+<div class="schedule-grid">
+  <div class="week">Week 1<br>Mar 24–30</div>
+  <div class="task"><strong>A:</strong> Sequential C++ baseline + correctness framework. Naive GPU baseline (CUB sort + gather). <strong>B:</strong> Data generation (Dirichlet-sampled routing at various skew). Benchmark harness + NCU integration. <strong>Together:</strong> Profile naive baseline, identify bottlenecks.</div>
+
+  <div class="week">Week 2<br>Mar 31–Apr 6</div>
+  <div class="task"><strong>A:</strong> Strategy B (atomic scatter) — global memory atomics, then SMEM atomics optimization. <strong>B:</strong> Strategy C (warp-cooperative scan) — ballot + popc + BlockScan + conflict-free scatter. <strong>Together:</strong> Correctness verification against sequential baseline.</div>
+
+  <div class="week">Week 3<br>Apr 7–13</div>
+  <div class="task"><em>[Milestone]</em> All three strategies running and profiled. Deliverables: (1) speedup-vs-sequential plot, (2) strategy comparison across <em>E</em> sweep, (3) initial NCU analysis. Identify which strategy needs optimization.</div>
+
+  <div class="week">Week 4<br>Apr 14–20</div>
+  <div class="task">Optimization pass: bank conflict padding, occupancy tuning, vectorized loads/stores. Full parameter sweep (<em>E × K × T ×</em> skew). End-to-end MoE layer benchmark. If ahead: start CPU OpenMP or multi-GPU work.</div>
+
+  <div class="week">Week 5<br>Apr 21–27</div>
+  <div class="task">Final analysis: roofline plots, crossover analysis. Report and poster. If ahead: finish hope-to-achieve items.</div>
+</div>
+
+</div>
+</body>
+</html>
