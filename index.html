@@ -168,7 +168,6 @@
     <li>An end to end single GPU MoE layer benchmark covering routing, packing, and expert GEMM</li>
     <li>Analysis of when and why each parallel strategy wins, with quantitative explanation grounded in hardware characteristics</li>
   </ul>
-  <p><strong>Quantitative targets:</strong> 10 to 20x speedup over sequential baseline. 2 to 4x speedup over the naive parallel baseline for models with a small number of experts. Best strategy achieves at least 70 percent of peak HBM bandwidth on the scatter operation.</p>
 </div>
 
 <div class="callout callout-blue">
@@ -191,12 +190,12 @@
 
 <h2>Platform Choice</h2>
 <p>
-  NVIDIA GPU is the natural platform for this workload. MoE inference runs on GPU in production, and the token packing problem directly exercises GPU specific parallel challenges: warp level SIMD coordination, shared memory bank conflicts, memory coalescing sensitivity, and atomic contention under skewed access patterns. We use CUDA C++ rather than higher level frameworks like Triton because we need explicit control over shared memory layout, warp intrinsics, and synchronization primitives to implement and meaningfully compare our strategies. The workload is memory bandwidth bound, and modern GPUs provide 1 to 3 TB/s of HBM bandwidth, making this the platform where optimization of irregular scatter has the greatest impact. If multi GPU hardware is available, we will additionally use NCCL for AllToAll communication, which exercises a different axis of parallel systems design: overlapping network transfers with on device computation using asynchronous streams.
+  NVIDIA GPU is the natural platform for this workload. MoE inference runs on GPU in production, and the token packing problem directly exercises GPU specific parallel challenges: warp level SIMD coordination, shared memory bank conflicts, memory coalescing sensitivity, and atomic contention under skewed access patterns. We use CUDA C++ rather than higher level frameworks like Triton because we need explicit control over shared memory layout, warp intrinsics, and synchronization primitives to implement and meaningfully compare our strategies. If multi GPU hardware is available, we will additionally use NCCL for AllToAll communication, which exercises a different axis of parallel systems design: overlapping network transfers with on device computation using asynchronous streams.
 </p>
 
 <h2>Schedule</h2>
 <div class="schedule-grid">
-  <div class="week">Week 1<br>Mar 24 to 30</div>
+  <div class="week">Week 1<br>Mar 25 to 30</div>
   <div class="task">Write the sequential baseline and the naive GPU parallel version. Set up data generation with configurable routing distributions and profiling infrastructure. Profile the naive approach and identify bottlenecks.</div>
 
   <div class="week">Week 2<br>Mar 31 to Apr 6</div>
