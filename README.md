@@ -1,6 +1,5 @@
-# Accelerating MoE Token Routing and Dispatch on GPU | 15-618 Project
+# Accelerating MoE Token Routing and Dispatch on GPU
 
----
 
 ## Overview
 
@@ -19,7 +18,6 @@ Step 3  │ Local Expert FFN                          (shrinks as chip count gro
 Step 4  │ AllToAll combine                          (cross-GPU communication)
 Step 5  │ Local Unpermute + weighted sum            (single GPU)
 
----
 
 ## Project Structure
 
@@ -28,8 +26,6 @@ Step 5  │ Local Unpermute + weighted sum            (single GPU)
   - **Core Functions:** `gen_uniform_routing()`, `gen_zipf_routing()`, `save_routing()`
   - Generates synthetic `assignments[T][K]` and `router_weights[T][K]` under uniform or Zipf
     distributions. Serializes to `.npy` for use across all kernels and benchmarks.
-
----
 
 ### 2. Baseline (`baseline/`) — *[C++ / CUDA]*
 - **`sequential_cpu.cpp`**
@@ -41,7 +37,6 @@ Step 5  │ Local Unpermute + weighted sum            (single GPU)
   - Per-expert block assignment baseline. Each CUDA block handles one expert;
     no load balancing. Serves as the performance floor.
 
----
 
 ### 3. Packing Strategies (`strategies/`) — *[CUDA]*
 - **`strategy_a_sort.cu`**
@@ -59,16 +54,14 @@ Step 5  │ Local Unpermute + weighted sum            (single GPU)
     offset so all lanes write independently.
     Reduces atomic ops from O(T·K) → O(T·K/32).
 
----
 
 ### 4. Fused Kernel (`fused/`) — *[CUDA]*
 - **`fused_routing_pack.cu`**
-  - **Core Functions:** `fused_gate_softmax_topk_scatter_kernel()`
-  - Fused Kernel 1: Gate → Softmax → Top-K → Strategy C scatter in one kernel pass.
+  - **Core Functions:** `fused_gate_topk_scatter_kernel()`
+  - Fuses the routing decision (Gate projection + Top-K selection) directly with the scatter operation.
     Eliminates intermediate HBM writes for routing metadata.
     Outputs `packed[T*K][d]` and `expert_count[E]`.
 
----
 
 ### 5. End-to-End Benchmark (`e2e/`) — *[CUDA]*
 - **`bench_e2e.cu`**
@@ -76,7 +69,6 @@ Step 5  │ Local Unpermute + weighted sum            (single GPU)
   - Fused Kernel 1 → grouped `cublasGemmEx` (one per expert) → Unpermute + weighted sum.
     Measures full MoE layer latency and throughput (tokens/s).
 
----
 
 ### 6. Correctness Verification (`verify/`) — *[CUDA]*
 - **`verify.cu`**
@@ -84,7 +76,6 @@ Step 5  │ Local Unpermute + weighted sum            (single GPU)
   - Compares any GPU strategy output against the CPU reference.
     Checks value correctness and that expert regions are non-overlapping and contiguous.
 
----
 
 ### 7. Benchmarking (`benchmark/`) — *[CUDA]*
 - **`bench_kernel.cu`**
@@ -96,14 +87,12 @@ Step 5  │ Local Unpermute + weighted sum            (single GPU)
   - Simulates AllToAll latency via CUDA streams + `cudaMemcpyAsync`, overlapping with
     local packing compute to estimate EP pipeline hiding.
 
----
 
 ### 8. Profiling (`profiling/`) — *[Shell]*
 - **`run_ncu.sh`**
   - Nsight Compute script. Captures HBM bandwidth, L2 sector traffic, shared memory bank
     conflicts, and atomic op counts per strategy. Outputs `.ncu-rep` to `results/`.
 
----
 
 ### 9. Analysis & Visualization (`analysis/`) — *[Python]*
 - **`scaling_projection.py`**
@@ -115,13 +104,11 @@ Step 5  │ Local Unpermute + weighted sum            (single GPU)
   - Generates all final figures: strategy latency comparison, atomic op counts,
     HBM bandwidth utilization, and EP scaling projection curves.
 
----
 
 ### 10. Results (`results/`)
 Raw benchmark CSVs, Nsight Compute `.ncu-rep` reports, and generated figures.
 Not checked into version control (except `.gitkeep`).
 
----
 
 ## Key Data Interfaces
 
@@ -134,7 +121,6 @@ Not checked into version control (except `.gitkeep`).
 | `expert_start` | `[E]` | int32 | Start offset per expert in `packed` |
 | `expert_count` | `[E]` | int32 | Token count per expert |
 
----
 
 ## TODO — By Phase
 
@@ -169,7 +155,6 @@ Not checked into version control (except `.gitkeep`).
 - [ ] Final report: motivation → methodology → results → EP scaling conclusion
 - [ ] Clean repo, confirm `verify.cu` passes all strategies, tag final commit
 
----
 
 ## Quick Start
 
@@ -189,4 +174,3 @@ bash profiling/run_ncu.sh strategy_c_warp
 # EP scaling projection
 python analysis/scaling_projection.py --max-gpus 64
 ```
-EOF
