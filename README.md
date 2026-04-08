@@ -10,13 +10,16 @@ We implement and compare 3 parallel strategies for the packing and dispatch pipe
 analyze the scaling behavior from one to several GPUs, and characterize the tradeoffs 
 between synchronization cost, memory bandwidth utilization, and communication overhead.
 
-**Key insight:** As GPU count increase, Step 3 FFN time shrinks linearly,
+**Key insight:** As GPU count increases, Step 3 FFN time shrinks linearly,
 but Step 1 packing time stays constant, **packing fraction grows and becomes the bottleneck.**
-Step 1  │ Scatter / Token Permutation / Packing     (single GPU)
-Step 2  │ AllToAll dispatch                         (cross-GPU communication)
-Step 3  │ Local Expert FFN                          (shrinks as chip count grows)
-Step 4  │ AllToAll combine                          (cross-GPU communication)
-Step 5  │ Local Unpermute + weighted sum            (single GPU)
+
+| Step | Operation                                    | Scope        | Scaling Behavior       |
+|------|----------------------------------------------|--------------|------------------------|
+| 1    | Scatter / Token Permutation / Packing        | Single GPU   | **Constant**           |
+| 2    | AllToAll dispatch                            | Cross-GPU    | Grows with N           |
+| 3    | Local Expert FFN                             | Single GPU   | **Shrinks as N grows** |
+| 4    | AllToAll combine                             | Cross-GPU    | Grows with N           |
+| 5    | Local Unpermute + Weighted Sum               | Single GPU   | Constant               |
 
 
 ## Project Structure
