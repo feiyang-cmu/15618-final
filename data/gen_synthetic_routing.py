@@ -223,9 +223,21 @@ def verify_routing(
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Sweep: three input sizes for benchmarking across workload scales
+# ─────────────────────────────────────────────────────────────────────────────
+
+SWEEP_SIZES = {
+    "small":  512,     # short prompt, single-request prefill
+    "medium": 2048,    # typical context window
+    "large":  8192,    # long-context prefill, where packing fraction dominates
+}
+
+
 if __name__ == "__main__":
     # usage: python data/gen_synthetic_routing.py --tokens 2048 --experts 64 --topk 4 --dim 2048
     # usage: python data/gen_synthetic_routing.py --dist zipf
+    # usage: python data/gen_synthetic_routing.py --sweep          # generates all 3 sizes x 2 dists
     parser = argparse.ArgumentParser(description="Generate synthetic MoE routing data")
     parser.add_argument("--tokens",  type=int,   default=2048,  help="Number of tokens T")
     parser.add_argument("--experts", type=int,   default=64,    help="Number of experts E")
@@ -236,25 +248,40 @@ if __name__ == "__main__":
     parser.add_argument("--dist",    type=str,   default="both",
                         choices=["uniform", "zipf", "both"],
                         help="Which distribution(s) to generate")
+    parser.add_argument("--sweep",   action="store_true",
+                        help="Generate small/medium/large sizes (ignores --tokens)")
     parser.add_argument("--out",     type=str,   default="results",
                         help="Output directory")
     args = parser.parse_args()
 
-    T, K, E, d = args.tokens, args.topk, args.experts, args.dim
+    K, E, d = args.topk, args.experts, args.dim
 
-    print(f"Config: T={T}  K={K}  E={E}  d={d}  alpha={args.alpha}  seed={args.seed}")
+    # Build list of (T, label) pairs to generate
+    if args.sweep:
+        runs = [(t, label) for label, t in SWEEP_SIZES.items()]
+    else:
+        runs = [(args.tokens, None)]
 
     ok = True
 
-    if args.dist in ("uniform", "both"):
-        emb, asgn, w = gen_uniform_routing(T, K, E, d, seed=args.seed)
-        ok &= verify_routing("Uniform", emb, asgn, w, T, K, E, d)
-        save_routing(args.out, "syn_uniform", emb, asgn, w)
+    for T, size_label in runs:
+        # File prefix: "syn_uniform" for single-run, "syn_uniform_T512" for sweep
+        tag = f"_T{T}" if size_label else ""
 
-    if args.dist in ("zipf", "both"):
-        emb, asgn, w = gen_zipf_routing(T, K, E, d, alpha=args.alpha, seed=args.seed)
-        ok &= verify_routing("Zipf", emb, asgn, w, T, K, E, d)
-        save_routing(args.out, "syn_zipf", emb, asgn, w)
+        print(f"\n{'─'*60}")
+        print(f"Config: T={T}  K={K}  E={E}  d={d}  alpha={args.alpha}  seed={args.seed}"
+              + (f"  [{size_label}]" if size_label else ""))
+        print(f"{'─'*60}")
+
+        if args.dist in ("uniform", "both"):
+            emb, asgn, w = gen_uniform_routing(T, K, E, d, seed=args.seed)
+            ok &= verify_routing(f"Uniform T={T}", emb, asgn, w, T, K, E, d)
+            save_routing(args.out, f"syn_uniform{tag}", emb, asgn, w)
+
+        if args.dist in ("zipf", "both"):
+            emb, asgn, w = gen_zipf_routing(T, K, E, d, alpha=args.alpha, seed=args.seed)
+            ok &= verify_routing(f"Zipf T={T}", emb, asgn, w, T, K, E, d)
+            save_routing(args.out, f"syn_zipf{tag}", emb, asgn, w)
 
     print(f"\n{'='*60}")
     print("  All checks passed ✓" if ok else "  SOME CHECKS FAILED ✗")
