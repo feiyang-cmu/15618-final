@@ -25,10 +25,12 @@ but Step 1 packing time stays constant, **packing fraction grows and becomes the
 ## Project Structure
 
 ### 1. Data Generation (`data/`) — *[Python]*
-- **`gen_routing.py`**
-  - **Core Functions:** `gen_uniform_routing()`, `gen_zipf_routing()`, `save_routing()`
-  - Generates synthetic `assignments[T][K]` and `router_weights[T][K]` under uniform or Zipf
-    distributions. Serializes to `.npy` for use across all kernels and benchmarks.
+- **`extract_qwen_routing.py`**
+  - **Core Functions:** `load_qwen_model()`, `extract_layer_0_gate()`, `compute_real_routing()`
+  - Uses Hugging Face `transformers` to load the lightweight `Qwen/Qwen1.5-MoE-A2.7B` model. Extracts the Layer 0 Gate weights, feeds real natural language input to get authentic Token Embeddings, and computes the real `assignments[T][K]` and `router_weights[T][K]`. Serializes to `.npy`.
+- **`gen_synthetic_routing.py`**
+  - **Core Functions:** `gen_uniform_routing()`, `gen_zipf_routing()`
+  - Generates purely mathematical uniform and Zipf distributions. Used as a ablation study to compare ideal topologies against real-world linguistic imbalances.
 
 ### 2. Baseline (`baseline/`) — *[C++ / CUDA]*
 - **`sequential_cpu.cpp`**
@@ -127,49 +129,51 @@ Not checked into version control (except `.gitkeep`).
 
 ## TODO — By Phase
 
-### Phase 1 — Infrastructure & Baseline (~6h)
-- [ ] `data/gen_routing.py`: uniform + Zipf routing generation, serialize to `.npy`
+### Phase 1 — Infrastructure & Baseline (~8h)
+- [x] `data/extract_qwen_routing.py`: Write script to pull Qwen1.5-MoE-A2.7B, extract Layer 0, feed real text, and export `real_embeddings.npy` and `real_assignments.npy`
+- [x] `data/gen_synthetic_routing.py`: Keep synthetic Uniform and Zipf generation for baseline ablation
 - [ ] `baseline/sequential_cpu.cpp`: correct serial scatter for ground-truth output
 - [ ] `baseline/naive_gpu.cu`: per-expert block assignment, verify against CPU reference
 - [ ] `verify/verify.cu`: automated correctness harness
 - [ ] **Signal**: all strategy outputs match CPU reference on both distributions
 
-### Phase 2 — Three Packing Strategies (~10h)
+### Phase 2 — Three Packing Strategies (~15h)
 - [ ] `strategies/strategy_a_sort.cu`: Radix Sort → coalesced gather
 - [ ] `strategies/strategy_b_atomic.cu`: per-thread atomicAdd scatter
-- [ ] `strategies/strategy_c_warp.cu`: warp-cooperative ballot + batched atomicAdd
+- [ ] `strategies/strategy_c_warp.cu`: warp-cooperative ballot and batched atomicAdd
 - [ ] `benchmark/bench_kernel.cu`: unified timing harness, parameter sweep
 - [ ] **Signal**: Strategy C shows fewer atomic ops (NCU) and lower HBM traffic than A+B under Zipf
 
-### Phase 3 — Fused Routing Kernel (~8h)
+### Phase 3 — Fused Routing Kernel (~15h)
 - [ ] `fused/fused_routing_pack.cu`: Gate + Softmax + Top-K + Scatter in one kernel
 - [ ] `e2e/bench_e2e.cu`: fused kernel → cuBLAS grouped GEMM → unpermute
 - [ ] **Signal**: fused kernel reduces HBM round-trips vs. chained kernels (NCU)
 
-### Phase 4 — Profiling & Analysis (~6h)
+### Phase 4 — Profiling & Analysis (~8h)
 - [ ] `profiling/run_ncu.sh`: collect bandwidth, bank conflicts, atomic counts
 - [ ] `analysis/scaling_projection.py`: project packing fraction across GPU counts
 - [ ] `benchmark/overlap_simulate.cu`: simulate AllToAll + compute overlap
-- [ ] `analysis/plot_results.py`: all final figures
-- [ ] **Signal**: projection shows packing fraction exceeds 40% at 16+ GPUs under Zipf
+- [ ] `analysis/plot_results.py`: Plot performance charts comparing Strategy A/B/C across three topologies: Synthetic Uniform, Synthetic Zipf, and Real Qwen Routing.
+- [ ] **Signal**: Strategy C demonstrates a significant speedup over Strategy B under the realistic, long-tail Qwen routing workload.
 
 ### Phase 5 — Write-up & Polish (~4h)
 - [ ] Results tables: throughput, latency breakdown, HBM utilization per strategy
-- [ ] Final report: motivation → methodology → results → EP scaling conclusion
-- [ ] Clean repo, confirm `verify.cu` passes all strategies, tag final commit
+- [ ] Final report & repo
 
 
 ## Quick Start
 
 ```bash
 # Generate routing data
-python data/gen_routing.py --tokens 4096 --experts 64 --topk 2 --dist zipf
+# RTX 2080 only 8GB VRAM, Target Dimensions: `d=2048`, `E=64`, `K=4`
+python data/gen_synthetic_routing.py --tokens 2048 --experts 64 --topk 4 --dim 2048
+python data/gen_synthetic_routing.py --dist zipf
 
 # Correctness check
-nvcc -O3 -arch=sm_80 verify/verify.cu -o verify && ./verify
+nvcc -O3 -arch=sm_75 verify/verify.cu -o verify && ./verify
 
 # Run strategy benchmark sweep
-nvcc -O3 -arch=sm_80 benchmark/bench_kernel.cu -o bench && ./bench
+nvcc -O3 -arch=sm_75 benchmark/bench_kernel.cu -o bench && ./bench
 
 # NCU profiling
 bash profiling/run_ncu.sh strategy_c_warp

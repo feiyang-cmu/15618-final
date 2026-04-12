@@ -1,0 +1,24 @@
+# MoE Token Routing & Dispatch Benchmark
+# Python 3.10+  |  CUDA 12.4  |  RTX 2080 (8 GB VRAM)
+#
+# Install:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+
+# Deep learning
+torch>=2.1.0
+accelerate>=0.27.0          # required for device_map="auto" in transformers
+
+# Model loading
+transformers>=4.40.0        # Qwen1.5-MoE-A2.7B support added in 4.40
+huggingface-hub>=0.22.0     # model/dataset download
+
+# Dataset
+datasets>=2.18.0            # WikiText-103 (Salesforce/wikitext)
+
+# Numerics & I/O
+numpy>=1.26.0               # .npy serialization, float16/int32 arrays
+
+# Analysis & visualization (Phase 4)
+matplotlib>=3.8.0
+pandas>=2.2.0
