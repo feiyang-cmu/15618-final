@@ -1,0 +1,23 @@
+# build artifacts
+baseline/sequential_cpu
+baseline/naive_gpu
+strategies/strategy_a_sort
+strategies/strategy_b_atomic
+strategies/strategy_c_warp
+fused/fused_routing_pack
+verify/verify
+benchmark/bench_kernel
+benchmark/overlap_simulate
+e2e/bench_e2e
+*.o
+*.ncu-rep
+
+# IDE
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# data (generated, large)
+results/*.npy
