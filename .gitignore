@@ -21,3 +21,6 @@ __pycache__/
 
 # data (generated, large)
 results/*.npy
+
+# vendored third_party (CUTLASS etc)
+third_party/
