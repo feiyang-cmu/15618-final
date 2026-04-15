@@ -1,4 +1,4 @@
-// grouped_gemm/test_grouped_gemm.cu
+// apps/grouped_gemm_test.cu
 //
 // Standalone sanity check: CUTLASS GemmGrouped vs sequential cuBLAS hgemm.
 // Mimics the per-expert up-projection of an MoE layer.
@@ -11,20 +11,15 @@
 //   (2) CUTLASS grouped GEMM: a single kernel launch for all E problems
 // Verify outputs match, then time each approach.
 //
-// Build:
-//   CUBLAS12=$HOME/miniconda3/envs/myenv/lib/python3.9/site-packages/nvidia/cublas
-//   CUTLASS=third_party/cutlass
-//   nvcc -O3 -std=c++17 -arch=sm_80 \
-//     -I${CUTLASS}/include -I${CUTLASS}/tools/util/include \
-//     -I${CUBLAS12}/include \
-//     grouped_gemm/test_grouped_gemm.cu -o grouped_gemm/test_grouped_gemm \
-//     -Xlinker -rpath=${CUBLAS12}/lib \
-//     -Xlinker ${CUBLAS12}/lib/libcublas.so.12 \
-//     -Xlinker ${CUBLAS12}/lib/libcublasLt.so.12
+// This binary doesn't touch IScatter — it's a pure GEMM microbench used to
+// motivate moving from per-expert hgemm to grouped GEMM in bench_e2e.
 //
+// Build is driven by the top-level Makefile (adds CUTLASS includes + cuBLAS).
 // Run:
-//   ./grouped_gemm/test_grouped_gemm          # uniform distribution
-//   ./grouped_gemm/test_grouped_gemm zipf     # zipf distribution
+//   ./build/bin/grouped_gemm_test          # uniform
+//   ./build/bin/grouped_gemm_test zipf     # zipf
+
+#include "moe/fp16_host.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -49,22 +44,6 @@
     std::fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); std::exit(1);}} while(0)
 #define CHECK_CUBLAS(call) do { cublasStatus_t s=(call); if(s!=CUBLAS_STATUS_SUCCESS){ \
     std::fprintf(stderr,"cuBLAS %s:%d: %d\n",__FILE__,__LINE__,(int)s); std::exit(1);}} while(0)
-
-// ------- fp16 <-> float host helpers -------
-static uint16_t f2h(float val) {
-    uint32_t f; std::memcpy(&f,&val,4);
-    uint32_t sign=(f>>31)&1; int32_t exp=((f>>23)&0xff)-127; uint32_t mant=f&0x7fffff;
-    if(exp>15) return (uint16_t)((sign<<15)|0x7c00);
-    if(exp<-14) return (uint16_t)(sign<<15);
-    return (uint16_t)((sign<<15)|((exp+15)<<10)|(mant>>13));
-}
-static float h2f(uint16_t h) {
-    uint32_t s=(h>>15)&1, e=(h>>10)&0x1f, m=h&0x3ff, f;
-    if(e==0){ if(m==0) f=s<<31; else{e=1;while(!(m&0x400)){m<<=1;e--;}m&=0x3ff;f=(s<<31)|((e+127-15)<<23)|(m<<13);}}
-    else if(e==31) f=(s<<31)|0x7f800000|(m<<13);
-    else f=(s<<31)|((e+127-15)<<23)|(m<<13);
-    float r; std::memcpy(&r,&f,4); return r;
-}
 
 // ---------------------------------------------------------------------------
 // CUTLASS grouped GEMM types (RowMajor all around, tensor op, sm_80)
@@ -123,7 +102,6 @@ static std::vector<int> make_counts(int E, int TK, const std::string& dist, uint
     std::vector<int> m(E, 0);
     std::mt19937 rng(seed);
     if (dist == "zipf") {
-        // zipf(1.0) over E experts, then multinomial draw of TK tokens
         std::vector<double> p(E);
         double s = 0;
         for (int e = 0; e < E; e++) { p[e] = 1.0 / (e + 1); s += p[e]; }
@@ -131,7 +109,6 @@ static std::vector<int> make_counts(int E, int TK, const std::string& dist, uint
         std::discrete_distribution<int> d(p.begin(), p.end());
         for (int i = 0; i < TK; i++) m[d(rng)]++;
     } else {
-        // uniform: multinomial with equal probs
         std::uniform_int_distribution<int> u(0, E - 1);
         for (int i = 0; i < TK; i++) m[u(rng)]++;
     }
@@ -160,7 +137,6 @@ static float run_sequential_cublas(
             const __half* A  = d_packed + (size_t)offA[e] * d;
             const __half* B1 = d_W1     + (size_t)e * d * d_ffn;
             __half*       C  = d_mid    + (size_t)offA[e] * d_ffn;
-            // row-major: C[M,N] = A[M,K] @ B[K,N]   (K=d, N=d_ffn, M=M[e])
             CHECK_CUBLAS(cublasHgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
                 d_ffn, M[e], d, &alpha, B1, d_ffn, A, d, &beta, C, d_ffn));
         }
@@ -187,7 +163,6 @@ static float run_grouped_cutlass(
 {
     int E = (int)M.size();
 
-    // Build per-problem metadata on the host, then copy to device.
     std::vector<cutlass::gemm::GemmCoord> problem_sizes;
     std::vector<ElementA*> h_ptrA;
     std::vector<ElementB*> h_ptrB;
@@ -198,18 +173,17 @@ static float run_grouped_cutlass(
 
     for (int e = 0; e < E; e++) {
         int m = M[e];
-        if (m == 0) continue;  // skip empty experts; grouped kernel doesn't like M=0
+        if (m == 0) continue;  // grouped kernel doesn't like M=0
         problem_sizes.emplace_back(m, d_ffn, d);
         h_ptrA.push_back( (ElementA*)(d_packed + (size_t)offA[e] * d) );
         h_ptrB.push_back( (ElementB*)(d_W1     + (size_t)e * d * d_ffn) );
         h_ptrC.push_back( (ElementC*)(d_mid    + (size_t)offA[e] * d_ffn) );
-        h_lda.push_back(d);       // A[m, d] row-major -> lda = d
-        h_ldb.push_back(d_ffn);   // B[d, d_ffn] row-major -> ldb = d_ffn
-        h_ldc.push_back(d_ffn);   // C[m, d_ffn] row-major -> ldc = d_ffn
+        h_lda.push_back(d);
+        h_ldb.push_back(d_ffn);
+        h_ldc.push_back(d_ffn);
     }
     int n_problems = (int)problem_sizes.size();
 
-    // Upload metadata arrays.
     cutlass::gemm::GemmCoord* d_problem_sizes = nullptr;
     ElementA** d_ptrA = nullptr; ElementB** d_ptrB = nullptr; ElementC** d_ptrC = nullptr;
     int64_t* d_lda = nullptr; int64_t* d_ldb = nullptr; int64_t* d_ldc = nullptr;
@@ -229,7 +203,6 @@ static float run_grouped_cutlass(
     CHECK_CUDA(cudaMemcpy(d_ldb, h_ldb.data(), sizeof(int64_t)*n_problems, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_ldc, h_ldc.data(), sizeof(int64_t)*n_problems, cudaMemcpyHostToDevice));
 
-    // Pick threadblock count: CUTLASS docs say >= active SMs works well.
     int dev = 0; cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
     int threadblock_count = GemmGrouped::sufficient(problem_sizes.data(), n_problems);
@@ -238,9 +211,9 @@ static float run_grouped_cutlass(
     typename GemmGrouped::EpilogueOutputOp::Params epilogue(ElementAcc(1.0f), ElementAcc(0.0f));
     typename GemmGrouped::Arguments args(
         d_problem_sizes, n_problems, threadblock_count, epilogue,
-        d_ptrA, d_ptrB, d_ptrC, d_ptrC,  // D == C (in-place; beta=0 so C is ignored)
+        d_ptrA, d_ptrB, d_ptrC, d_ptrC,
         d_lda, d_ldb, d_ldc, d_ldc,
-        problem_sizes.data());  // host copy used for heuristics
+        problem_sizes.data());
 
     GemmGrouped gemm;
     size_t ws = gemm.get_workspace_size(args);
@@ -284,7 +257,7 @@ static bool verify(const __half* a, const __half* b, size_t n, float tol) {
     float max_abs = 0, max_rel = 0;
     int bad = 0;
     for (size_t i = 0; i < n; i++) {
-        float x = h2f(ha[i]), y = h2f(hb[i]);
+        float x = moe::h2f(ha[i]), y = moe::h2f(hb[i]);
         float da = std::fabs(x - y);
         float dr = da / (std::fabs(x) + 1e-6f);
         max_abs = std::max(max_abs, da);
@@ -299,7 +272,6 @@ int main(int argc, char** argv) {
     std::string dist = (argc > 1) ? argv[1] : "uniform";
     int T = (argc > 2) ? std::atoi(argv[2]) : 2048;
 
-    // MoE layer shape: match our Qwen-sim setup
     const int K = 4, E = 64;
     const int d = 2048, d_ffn = 8192;
     const int TK = T * K;
@@ -307,7 +279,6 @@ int main(int argc, char** argv) {
     std::printf("=== Grouped GEMM test (%s) ===\n", dist.c_str());
     std::printf("T=%d K=%d E=%d d=%d d_ffn=%d TK=%d\n\n", T, K, E, d, d_ffn, TK);
 
-    // per-expert counts and offsets
     auto M = make_counts(E, TK, dist, 7);
     std::vector<int> off(E, 0);
     for (int e = 1; e < E; e++) off[e] = off[e-1] + M[e-1];
@@ -316,20 +287,18 @@ int main(int argc, char** argv) {
     std::printf("per-expert M: min=%d max=%d mean=%d (imbalance %.1fx)\n\n",
                 min_m, max_m, TK/E, (float)max_m / (TK/E));
 
-    // Allocate contiguous buffers
     __half *d_packed, *d_W1, *d_mid_cublas, *d_mid_cutlass;
     CHECK_CUDA(cudaMalloc(&d_packed,      (size_t)TK * d * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_W1,          (size_t)E * d * d_ffn * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_mid_cublas,  (size_t)TK * d_ffn * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_mid_cutlass, (size_t)TK * d_ffn * sizeof(__half)));
 
-    // Fill with small random values so output doesn't overflow fp16
     std::vector<uint16_t> h_buf(std::max((size_t)TK*d, (size_t)E*d*d_ffn));
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> uni(-0.02f, 0.02f);
-    for (size_t i = 0; i < (size_t)TK*d; i++) h_buf[i] = f2h(uni(rng));
+    for (size_t i = 0; i < (size_t)TK*d; i++) h_buf[i] = moe::f2h(uni(rng));
     CHECK_CUDA(cudaMemcpy(d_packed, h_buf.data(), (size_t)TK*d*2, cudaMemcpyHostToDevice));
-    for (size_t i = 0; i < (size_t)E*d*d_ffn; i++) h_buf[i] = f2h(uni(rng));
+    for (size_t i = 0; i < (size_t)E*d*d_ffn; i++) h_buf[i] = moe::f2h(uni(rng));
     CHECK_CUDA(cudaMemcpy(d_W1, h_buf.data(), (size_t)E*d*d_ffn*2, cudaMemcpyHostToDevice));
 
     cublasHandle_t cublas; CHECK_CUBLAS(cublasCreate(&cublas));
