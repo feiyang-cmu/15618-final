@@ -95,6 +95,8 @@ AtomicWorkspace plan_workspace(const MoEParams& p) {
     return ws;
 }
 
+} // namespace (anonymous)
+
 class AtomicScatter final : public IScatter {
 public:
     const char* name() const override { return "atomic"; }
@@ -153,12 +155,8 @@ public:
     }
 };
 
-} // namespace
-
-std::unique_ptr<IScatter> make_scatter(const std::string& name) {
-    if (name == "atomic") return std::make_unique<AtomicScatter>();
-    // "sort" and "warp" are added on their respective branches.
-    return nullptr;
+std::unique_ptr<IScatter> make_atomic_scatter() {
+    return std::make_unique<AtomicScatter>();
 }
 
 } // namespace moe

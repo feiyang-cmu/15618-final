@@ -43,10 +43,12 @@ $(shell mkdir -p $(OBJ_DIR) $(BIN_DIR))
 COMMON_SRCS := src/common/npy_io.cpp src/common/cpu_reference.cpp
 COMMON_OBJS := $(patsubst src/%.cpp,$(OBJ_DIR)/%.o,$(COMMON_SRCS))
 
-# Scatter strategy objects. Add new strategies here as they come online.
-SCATTER_SRCS := src/scatter/scatter_atomic.cu
-# Future (land on their own branches):
-#   src/scatter/scatter_sort.cu
+# Scatter strategy objects + factory. Factory lives here so every binary that
+# links strategies also gets dispatch.
+SCATTER_SRCS := src/scatter/factory.cu \
+                src/scatter/scatter_atomic.cu \
+                src/scatter/scatter_sort.cu
+# Future (land on its own branch):
 #   src/scatter/scatter_warp.cu
 SCATTER_OBJS := $(patsubst src/%.cu,$(OBJ_DIR)/%.o,$(SCATTER_SRCS))
 

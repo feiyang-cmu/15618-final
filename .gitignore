@@ -3,6 +3,9 @@ build/
 *.o
 *.ncu-rep
 
+# local experiment logs — benchmark data stays out of history
+analysis/*.md
+
 # IDE
 .vscode/
 
