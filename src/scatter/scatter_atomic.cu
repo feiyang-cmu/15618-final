@@ -24,12 +24,26 @@
 namespace moe {
 namespace {
 
+// Block-local histogram into shared memory, then one global atomicAdd per
+// (block, expert). For small E this eliminates the global-atomic hotspot that
+// plagues the naive per-thread atomicAdd implementation — the old e2e code
+// side-stepped this by folding count into topk_kernel, which isn't possible
+// once counting lives behind the IScatter boundary.
 __global__ void count_kernel(const int32_t* __restrict__ assignments,
                              int32_t*       __restrict__ expert_count,
-                             int TK) {
+                             int TK, int E) {
+    extern __shared__ int32_t s_hist[];  // [E]
+    for (int i = threadIdx.x; i < E; i += blockDim.x) s_hist[i] = 0;
+    __syncthreads();
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= TK) return;
-    atomicAdd(&expert_count[assignments[idx]], 1);
+    if (idx < TK) atomicAdd(&s_hist[assignments[idx]], 1);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        int32_t v = s_hist[i];
+        if (v) atomicAdd(&expert_count[i], v);
+    }
 }
 
 __global__ void scatter_kernel(const __half*  __restrict__ emb,          // [T, d]
@@ -112,7 +126,8 @@ public:
         // Step 1: count.
         device_zero_async(bufs.expert_count, (std::size_t)p.E, stream);
         tc.start(stream);
-        count_kernel<<<grid, block, 0, stream>>>(d_asgn, bufs.expert_count, TK);
+        count_kernel<<<grid, block, p.E * sizeof(int32_t), stream>>>(
+            d_asgn, bufs.expert_count, TK, p.E);
         t.count_ms = tc.stop_ms(stream);
 
         // Step 2: exclusive prefix sum.
