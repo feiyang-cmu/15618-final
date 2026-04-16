@@ -381,14 +381,28 @@ static void run_full(const std::string& prefix, int E_cli,
         std::fprintf(stderr, "unexpected dtypes\n"); return;
     }
 
+    // E must be at least max(assignments)+1 or the scatter scratch buffers
+    // (expert_count[E], expert_start[E+1]) get OOB-indexed. verify / bench_scatter
+    // auto-upgrade from the data; do the same here instead of blindly trusting
+    // the CLI arg.
+    const int32_t* a = asgn.as_i32();
+    int32_t max_e = -1;
+    for (std::size_t i = 0; i < asgn.rows * asgn.cols; ++i)
+        if (a[i] > max_e) max_e = a[i];
+    const int E_data = (int)(max_e + 1);
+
     moe::MoEParams p{};
     p.T       = (int)emb.rows;
     p.K       = (int)asgn.cols;
-    p.E       = E_cli;
+    p.E       = std::max(E_cli, E_data);
     p.d_model = (int)emb.cols;
     p.d_ffn   = p.d_model * 4;
     const int TK = p.T * p.K;
 
+    if (p.E != E_cli) {
+        std::printf("[warn] CLI asked E=%d, data requires E>=%d — using E=%d\n",
+                    E_cli, E_data, p.E);
+    }
     std::printf("T=%d K=%d E=%d d=%d d_ffn=%d packed_rows=%d\n",
                 p.T, p.K, p.E, p.d_model, p.d_ffn, TK);
 
