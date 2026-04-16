@@ -1,0 +1,20 @@
+# build artifacts
+build/
+*.o
+*.ncu-rep
+
+# local experiment logs — benchmark data stays out of history
+analysis/*.md
+
+# IDE
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# data (generated, large)
+results/*.npy
+
+# vendored third_party (CUTLASS etc)
+third_party/
