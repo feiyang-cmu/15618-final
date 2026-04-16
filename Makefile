@@ -47,9 +47,8 @@ COMMON_OBJS := $(patsubst src/%.cpp,$(OBJ_DIR)/%.o,$(COMMON_SRCS))
 # links strategies also gets dispatch.
 SCATTER_SRCS := src/scatter/factory.cu \
                 src/scatter/scatter_atomic.cu \
-                src/scatter/scatter_sort.cu
-# Future (land on its own branch):
-#   src/scatter/scatter_warp.cu
+                src/scatter/scatter_sort.cu \
+                src/scatter/scatter_warp.cu
 SCATTER_OBJS := $(patsubst src/%.cu,$(OBJ_DIR)/%.o,$(SCATTER_SRCS))
 
 # Apps (each compiles + links into its own binary).

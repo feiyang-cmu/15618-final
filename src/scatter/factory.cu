@@ -11,6 +11,7 @@ namespace moe {
 std::unique_ptr<IScatter> make_scatter(const std::string& name) {
     if (name == "atomic") return make_atomic_scatter();
     if (name == "sort")   return make_sort_scatter();
+    if (name == "warp")   return make_warp_scatter();
     return nullptr;
 }
 

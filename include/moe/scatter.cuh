@@ -56,6 +56,7 @@ public:
 // Per-strategy constructors. Each strategy defines exactly one of these.
 std::unique_ptr<IScatter> make_atomic_scatter();
 std::unique_ptr<IScatter> make_sort_scatter();
+std::unique_ptr<IScatter> make_warp_scatter();
 
 /// Factory. Accepted names: "atomic", "sort" (Phase 2), "warp" (Phase 3).
 /// Returns nullptr for unknown names.
