@@ -11,18 +11,21 @@
 #   make objects      # just the .o files
 #   make clean
 #
-# CUDA arch / cuBLAS path are overridable from the command line:
+# CUDA arch / cuBLAS / NCCL path are overridable from the command line:
 #   make ARCH=sm_89
 #   make CUBLAS12=/alt/path
+#   make NCCL=/alt/path
 
 # ---- toolchain -------------------------------------------------------------
 NVCC      ?= nvcc
 ARCH      ?= sm_86
 CUBLAS12  ?= $(HOME)/miniconda3/envs/myenv/lib/python3.9/site-packages/nvidia/cublas
 CUTLASS   ?= third_party/cutlass
+NCCL      ?= $(HOME)/.local/lib/python3.6/site-packages/nvidia/nccl
 
 INCLUDES  := -Iinclude -I$(CUBLAS12)/include
 CUTLASS_INC := -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include
+NCCL_INC  := -I$(NCCL)/include
 NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) --expt-relaxed-constexpr $(INCLUDES)
 
 # cuBLAS 12 from conda (driver 572.83 is incompatible with CUDA 11.6 cuBLAS).
@@ -30,6 +33,8 @@ CUBLAS_LINK := -Xlinker -rpath=$(CUBLAS12)/lib \
                -Xlinker $(CUBLAS12)/lib/libcublas.so.12 \
                -Xlinker $(CUBLAS12)/lib/libcublasLt.so.12
 NVTX_LINK   := -lnvToolsExt
+NCCL_LINK   := -Xlinker -rpath=$(NCCL)/lib \
+               -Xlinker $(NCCL)/lib/libnccl.so.2
 
 # ---- directories -----------------------------------------------------------
 BUILD_DIR := build
@@ -52,7 +57,8 @@ SCATTER_SRCS := src/scatter/factory.cu \
 SCATTER_OBJS := $(patsubst src/%.cu,$(OBJ_DIR)/%.o,$(SCATTER_SRCS))
 
 # Apps (each compiles + links into its own binary).
-APP_SRCS := apps/verify.cu apps/bench_scatter.cu apps/bench_e2e.cu apps/grouped_gemm_test.cu
+APP_SRCS := apps/verify.cu apps/bench_scatter.cu apps/bench_e2e.cu \
+            apps/grouped_gemm_test.cu apps/bench_ep.cu
 APP_BINS := $(patsubst apps/%.cu,$(BIN_DIR)/%,$(APP_SRCS))
 
 # ---- default goal ----------------------------------------------------------
@@ -78,6 +84,8 @@ EXTRA_INC  ?=
 $(BIN_DIR)/bench_e2e:          LINK_EXTRA := $(CUBLAS_LINK) $(NVTX_LINK)
 $(BIN_DIR)/grouped_gemm_test:  LINK_EXTRA := $(CUBLAS_LINK)
 $(BIN_DIR)/grouped_gemm_test:  EXTRA_INC  := $(CUTLASS_INC)
+$(BIN_DIR)/bench_ep:           LINK_EXTRA := $(NCCL_LINK)
+$(BIN_DIR)/bench_ep:           EXTRA_INC  := $(NCCL_INC)
 
 $(BIN_DIR)/%: apps/%.cu $(SCATTER_OBJS) $(COMMON_OBJS)
 	$(NVCC) $(NVCCFLAGS) $(EXTRA_INC) $< $(SCATTER_OBJS) $(COMMON_OBJS) $(LINK_EXTRA) -o $@

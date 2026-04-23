@@ -42,12 +42,13 @@ but Step 1 packing time stays constant, **packing fraction grows and becomes the
 │       ├── factory.cu          # make_scatter(): dispatches "atomic" / "sort" / "warp"
 │       ├── scatter_atomic.cu   # Atomic strategy: shared-mem histogram + CUB prefix sum + atomicAdd scatter
 │       ├── scatter_sort.cu     # Sort strategy: CUB radix sort + binary-search bounds + block-per-row gather
-│       └── scatter_warp.cu     # Warp strategy: same sort pipeline, warp-per-row gather kernel
+│       └── scatter_warp.cu     # Warp strategy: ballot-based warp-cooperative scatter (no sort)
 │
 ├── apps/
 │   ├── verify.cu           # Correctness harness: runs CPU reference + any IScatter, checks invariants
 │   ├── bench_scatter.cu    # Isolated scatter benchmark: auto-scales iters, reports min/p50/p90/p99/mean
-│   ├── bench_e2e.cu        # End-to-end MoE layer: naive/fused routing → IScatter → cuBLAS GEMM → unpack
+│   ├── bench_e2e.cu        # End-to-end single-GPU MoE layer: routing → IScatter → cuBLAS GEMM → unpack
+│   ├── bench_ep.cu         # 2-GPU Expert Parallelism benchmark: scatter + NCCL AllToAll dispatch/combine
 │   └── grouped_gemm_test.cu # CUTLASS grouped GEMM vs sequential cuBLAS hgemm microbench (requires CUTLASS)
 │
 ├── data/
@@ -111,11 +112,11 @@ but Step 1 packing time stays constant, **packing fraction grows and becomes the
     kernel copies each token row to its sorted position with full memory coalescing.
     Eliminates all write conflicts at the cost of two full HBM passes.
 - **`scatter_warp.cu`**
-  - **Core Functions:** `gather_rows_warp_kernel()`
-  - Identical sort pipeline to `scatter_sort.cu`. Only the gather kernel differs:
-    uses one warp (32 threads) per output row instead of one block, packing four rows
-    per block launch (`kWarpsPerBlock = 4`). Reduces launch overhead at smaller `d_model`
-    but the crossover with block-per-row favors sort at d=2048.
+  - **Core Functions:** `count_kernel()`, `ballot_scatter_kernel()`
+  - Ballot-based warp-cooperative scatter (no sort). Each warp uses `__ballot_sync` to
+    identify which lanes target the same expert, issues one `atomicAdd` per warp per expert
+    to claim slots, then each matching lane copies its embedding row independently.
+    Reduces atomic ops from O(T×K) to O(T×K/32) and eliminates the sort's two HBM passes.
 
 
 ### 4. Applications (`apps/`) — *[CUDA]*
@@ -135,6 +136,14 @@ but Step 1 packing time stays constant, **packing fraction grows and becomes the
     3 separate kernel launches; fused: gate + softmax + topK in one kernel) and
     any `IScatter` strategy. Expert FFNs use sequential `cublasHgemm` calls (up-proj
     then down-proj per expert). Measures per-stage latency breakdown.
+- **`bench_ep.cu`**
+  - **Core Functions:** `rank_worker()`, `Barrier2`
+  - 2-GPU Expert Parallelism benchmark using NCCL. Two CPU threads each control one
+    GPU. Each GPU runs local scatter via `IScatter`, then NCCL `AllToAll` dispatches
+    packed tokens to the GPU owning each expert, and a second `AllToAll` combines
+    results back. Measures scatter, dispatch, and combine latency independently to
+    quantify how packing fraction grows as FFN is distributed across GPUs.
+    Requires NCCL; build with `NCCL=<path>`.
 - **`grouped_gemm_test.cu`**
   - **Core Functions:** `run_sequential_cublas()`, `run_grouped_cutlass()`
   - Microbench comparing sequential cuBLAS hgemm (one call per expert) against a
@@ -193,14 +202,16 @@ Four stages: initialize slot indices 0..TK-1; CUB `DeviceRadixSort::SortPairs` o
 (expert\_id, slot\_index) using only log₂(E) bits; E+1 parallel binary searches to
 compute `expert_start`; a block-per-output-row gather kernel copies each source token
 row to its sorted position with full memory coalescing. Eliminates all write conflicts.
- 
+
 **Warp** (`scatter_warp.cu`)
-Identical sort pipeline to Strategy Sort. Only the gather kernel differs: uses one
-warp (32 threads) per output row instead of one block, packing multiple rows into
-each block launch. At smaller embedding dimensions this reduces launch overhead; at
-d=2048 the crossover favors the block-per-row variant.
- 
- 
+Three stages: shared-memory histogram count; CUB `ExclusiveSum`; ballot-based scatter.
+Each warp uses `__ballot_sync` and `__popc` to identify lanes targeting the same expert,
+issues one `atomicAdd` per warp per expert to claim consecutive slots, then each
+matching lane copies its own embedding row independently. Reduces atomic operations
+from O(T×K) to O(T×K/32) and eliminates the two full HBM passes required by the
+sort-based approach.
+
+
 ## Build
  
 The project requires CUDA 11.7 and gcc-11 on GHC machines. System CUDA 11.7 ships
@@ -212,6 +223,12 @@ pytorch installation instead.
 make ARCH=sm_75 \
   NVCCFLAGS="-O3 -std=c++17 -arch=sm_75 --expt-relaxed-constexpr -Iinclude -ccbin gcc-11 -lstdc++ -lm" \
   CUBLAS12=/opt/pytorch/lib/python3.12/site-packages/nvidia/cublas
+
+# PSC machines (sm_70, V100, with NCCL for bench_ep)
+make ARCH=sm_70 \
+  NVCCFLAGS="-O3 -std=c++17 -arch=sm_70 --expt-relaxed-constexpr -Iinclude" \
+  CUBLAS_LINK="" \
+  NCCL=/jet/home/<user>/.local/lib/python3.6/site-packages/nvidia/nccl
  
 # Other machines (default in Makefile, sm_86, conda cuBLAS)
 make
@@ -285,8 +302,19 @@ make ARCH=sm_75 \
 ./build/bin/bench_e2e syn_uniform_T2048
 ./build/bin/bench_e2e syn_zipf_T2048
 ```
+
+### 7. 2-GPU Expert Parallelism benchmark
+
+Requires 2 GPUs with P2P access and NCCL. Build with `NCCL=<path>` as shown above.
+
+```bash
+./build/bin/bench_ep --prefix=syn_uniform_T2048 --strategy=sort
+./build/bin/bench_ep --prefix=syn_zipf_T2048   --strategy=sort
+./build/bin/bench_ep --prefix=syn_uniform_T8192 --strategy=warp
+./build/bin/bench_ep --prefix=syn_zipf_T8192   --strategy=warp
+```
  
-### 7. Nsight Compute profiling
+### 8. Nsight Compute profiling
  
 ```bash
 bash profiling/run_ncu.sh atomic
@@ -294,7 +322,7 @@ bash profiling/run_ncu.sh sort
 bash profiling/run_ncu.sh warp
 ```
  
-### 8. Analysis and plotting
+### 9. Analysis and plotting
  
 ```bash
 python analysis/scaling_projection.py --max-gpus 64
