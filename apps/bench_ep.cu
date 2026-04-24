@@ -1,9 +1,9 @@
 // apps/bench_ep.cu
 //
-// 2-GPU Expert Parallelism benchmark.
+// N-GPU Expert Parallelism benchmark.
 //
 // Measures the latency of each stage in a single MoE layer forward pass
-// across 2 GPUs using Expert Parallelism:
+// across N GPUs using Expert Parallelism:
 //
 //   Stage 1 — Local Scatter    : each GPU packs its T tokens by expert
 //   Stage 2 — AllToAll Dispatch: tokens sent to the GPU owning each expert
@@ -13,13 +13,14 @@
 // bench_e2e. The goal is to show how scatter + communication overhead
 // compares to FFN time as GPU count increases.
 //
-// Expert assignment: GPU 0 owns experts [0, E/2), GPU 1 owns [E/2, E).
-// AllToAll uses fixed-size chunks (TK/2 * d_model elements per rank),
+// Expert assignment: GPU r owns experts [r*E/N, (r+1)*E/N).
+// AllToAll uses fixed-size chunks (TK/N * d_model elements per rank pair),
 // which is exact under uniform routing and approximate under Zipf.
 //
 // Usage:
 //   ./build/bin/bench_ep --prefix=syn_uniform_T2048 --strategy=sort
-//   ./build/bin/bench_ep --prefix=syn_zipf_T8192   --strategy=warp
+//   ./build/bin/bench_ep --prefix=syn_uniform_T4096 --strategy=warp --n-gpus=4
+//   ./build/bin/bench_ep --prefix=syn_uniform_T8192 --strategy=warp --n-gpus=8
 
 #include "moe/cpu_reference.hpp"
 #include "moe/npy_io.hpp"
@@ -53,18 +54,21 @@
         }                                                                       \
     } while (0)
 
-// ── Simple barrier for exactly 2 threads ─────────────────────────────────────
+// ── Barrier for N threads ────────────────────────────────────────────────────
 
-struct Barrier2 {
+struct BarrierN {
     std::mutex              mtx;
     std::condition_variable cv;
     int count      = 0;
     int generation = 0;
+    int n          = 0;
+
+    explicit BarrierN(int n_threads) : n(n_threads) {}
 
     void wait() {
         std::unique_lock<std::mutex> lk(mtx);
         int gen = generation;
-        if (++count == 2) {
+        if (++count == n) {
             count = 0;
             ++generation;
             cv.notify_all();
@@ -90,6 +94,7 @@ struct Config {
     std::string data_dir  = "results";
     std::string strategy  = "sort";
     int         E_cli     = 64;
+    int         n_gpus    = 0;
     int         warmup    = 5;
     int         iters     = 20;
 };
@@ -108,12 +113,13 @@ Config parse(int argc, char** argv) {
         else if (k == "data-dir") c.data_dir = v;
         else if (k == "strategy") c.strategy = v;
         else if (k == "E")        c.E_cli    = std::atoi(v.c_str());
+        else if (k == "n-gpus")   c.n_gpus   = std::atoi(v.c_str());
         else if (k == "warmup")   c.warmup   = std::atoi(v.c_str());
         else if (k == "iters")    c.iters    = std::atoi(v.c_str());
         else { std::fprintf(stderr, "unknown flag --%s\n", k.c_str()); std::exit(1); }
     }
     if (c.prefix.empty()) {
-        std::fprintf(stderr, "usage: --prefix=<name> [--strategy=...]\n");
+        std::fprintf(stderr, "usage: --prefix=<name> [--strategy=...] [--n-gpus=N]\n");
         std::exit(1);
     }
     return c;
@@ -125,7 +131,7 @@ void rank_worker(
     int           rank,
     int           n_ranks,
     ncclComm_t    comm,
-    Barrier2&     barrier,
+    BarrierN&     barrier,
     const Config& cfg,
     EPResult*     out)
 {
@@ -195,7 +201,6 @@ void rank_worker(
         scatter->run(d_emb, d_asgn, d_wts, bufs, p, stream);
         MOE_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // dispatch: packed -> d_dispatch_recv
         barrier.wait();
         NCCL_CHECK(ncclGroupStart());
         for (int r = 0; r < n_ranks; ++r) {
@@ -209,7 +214,6 @@ void rank_worker(
         NCCL_CHECK(ncclGroupEnd());
         MOE_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // combine: d_dispatch_recv -> d_combine_recv
         barrier.wait();
         NCCL_CHECK(ncclGroupStart());
         for (int r = 0; r < n_ranks; ++r) {
@@ -297,41 +301,54 @@ void rank_worker(
 int main(int argc, char** argv) {
     Config cfg = parse(argc, argv);
 
-    int n_gpus = 0;
-    MOE_CUDA_CHECK(cudaGetDeviceCount(&n_gpus));
-    if (n_gpus < 2) {
-        std::fprintf(stderr, "Need at least 2 GPUs, found %d\n", n_gpus);
+    int n_available = 0;
+    MOE_CUDA_CHECK(cudaGetDeviceCount(&n_available));
+
+    int n_ranks = cfg.n_gpus > 0 ? cfg.n_gpus : n_available;
+    if (n_ranks < 2) {
+        std::fprintf(stderr, "Need at least 2 GPUs, found %d\n", n_available);
         return 1;
     }
-    const int n_ranks = 2;
+    if (n_ranks > n_available) {
+        std::fprintf(stderr, "Requested %d GPUs but only %d available\n",
+                     n_ranks, n_available);
+        return 1;
+    }
 
     std::printf("\n== bench_ep  strategy=%s  prefix=%s  n_gpus=%d ==\n\n",
                 cfg.strategy.c_str(), cfg.prefix.c_str(), n_ranks);
 
     // ── NCCL init ─────────────────────────────────────────────────────────────
-    ncclComm_t comms[2];
-    int dev_ids[2] = {0, 1};
-    NCCL_CHECK(ncclCommInitAll(comms, n_ranks, dev_ids));
+    std::vector<ncclComm_t> comms(n_ranks);
+    std::vector<int> dev_ids(n_ranks);
+    for (int i = 0; i < n_ranks; ++i) dev_ids[i] = i;
+    NCCL_CHECK(ncclCommInitAll(comms.data(), n_ranks, dev_ids.data()));
 
     // ── Launch per-rank threads ────────────────────────────────────────────────
-    Barrier2  barrier;
-    EPResult  results[2];
+    BarrierN barrier(n_ranks);
+    std::vector<EPResult> results(n_ranks);
+    std::vector<std::thread> threads;
 
-    std::thread t0(rank_worker, 0, n_ranks, comms[0],
-                   std::ref(barrier), std::cref(cfg), &results[0]);
-    std::thread t1(rank_worker, 1, n_ranks, comms[1],
-                   std::ref(barrier), std::cref(cfg), &results[1]);
-    t0.join();
-    t1.join();
+    for (int r = 0; r < n_ranks; ++r) {
+        threads.emplace_back(rank_worker, r, n_ranks, comms[r],
+                             std::ref(barrier), std::cref(cfg), &results[r]);
+    }
+    for (auto& t : threads) t.join();
 
-    // ── Print results (average over 2 ranks) ──────────────────────────────────
-    float scatter_ms  = (results[0].scatter_ms  + results[1].scatter_ms)  / 2.f;
-    float dispatch_ms = (results[0].dispatch_ms + results[1].dispatch_ms) / 2.f;
-    float combine_ms  = (results[0].combine_ms  + results[1].combine_ms)  / 2.f;
-    float total_ms    = scatter_ms + dispatch_ms + combine_ms;
+    // ── Print results (average over all ranks) ────────────────────────────────
+    float scatter_ms = 0, dispatch_ms = 0, combine_ms = 0;
+    for (int r = 0; r < n_ranks; ++r) {
+        scatter_ms  += results[r].scatter_ms;
+        dispatch_ms += results[r].dispatch_ms;
+        combine_ms  += results[r].combine_ms;
+    }
+    scatter_ms  /= n_ranks;
+    dispatch_ms /= n_ranks;
+    combine_ms  /= n_ranks;
+    float total_ms = scatter_ms + dispatch_ms + combine_ms;
 
-    std::printf("  warmup=%d  iters=%d  (median over iters, avg over 2 GPUs)\n\n",
-                cfg.warmup, cfg.iters);
+    std::printf("  warmup=%d  iters=%d  (median over iters, avg over %d GPUs)\n\n",
+                cfg.warmup, cfg.iters, n_ranks);
     std::printf("  scatter:   %8.3f ms  (%5.1f%%)\n",
                 scatter_ms,  scatter_ms  / total_ms * 100.f);
     std::printf("  dispatch:  %8.3f ms  (%5.1f%%)\n",
@@ -343,7 +360,8 @@ int main(int argc, char** argv) {
 
     std::printf("  Note: FFN time excluded (see bench_e2e for single-GPU FFN latency).\n");
     std::printf("  EP overhead = scatter + dispatch + combine\n");
-    std::printf("  Compare against single-GPU scatter + FFN/2 to see packing fraction growth.\n\n");
+    std::printf("  Compare against single-GPU scatter + FFN/%d to see packing fraction growth.\n\n",
+                n_ranks);
 
     for (int r = 0; r < n_ranks; ++r)
         NCCL_CHECK(ncclCommDestroy(comms[r]));

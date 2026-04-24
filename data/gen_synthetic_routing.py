@@ -229,8 +229,10 @@ def verify_routing(
 
 SWEEP_SIZES = {
     "small":  512,     # short prompt, single-request prefill
-    "medium": 2048,    # typical context window
-    "large":  8192,    # long-context prefill, where packing fraction dominates
+    "medium": 2048,    # typical context window (2-GPU baseline)
+    "large":  4096,    # 4-GPU scaling test
+    "xlarge": 8192,    # 8-GPU scaling test
+    "xxlarge":16384,   # stress test / future scaling
 }
 
 

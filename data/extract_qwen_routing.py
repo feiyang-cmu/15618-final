@@ -201,12 +201,14 @@ def save_routing(
     embeddings: np.ndarray,
     assignments: np.ndarray,
     weights: np.ndarray,
+    prefix: str = "real",
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
-    np.save(os.path.join(out_dir, "real_embeddings.npy"),  embeddings)
-    np.save(os.path.join(out_dir, "real_assignments.npy"), assignments)
-    np.save(os.path.join(out_dir, "real_weights.npy"),     weights)
-    print(f"[save] Saved to {out_dir}/real_*.npy")
+    np.save(os.path.join(out_dir, f"{prefix}_embeddings.npy"),  embeddings)
+    np.save(os.path.join(out_dir, f"{prefix}_assignments.npy"), assignments)
+    np.save(os.path.join(out_dir, f"{prefix}_weights.npy"),     weights)
+    print(f"[save] Saved to {out_dir}/{prefix}_*.npy  "
+          f"(embeddings {embeddings.shape}, assignments {assignments.shape})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,12 +295,13 @@ def verify_routing(
 # usage: python extract_qwen_routing.py --dry-run --topk 4 --out results
 # ─────────────────────────────────────────────────────────────────────────────
 
-def dry_run(T: int, K: int, E: int, d: int, out_dir: str) -> None:
+def dry_run(T: int, K: int, E: int, d: int, out_dir: str,
+            prefix: str = "real") -> None:
     """
     Generate fake routing data with a realistic Zipf-like imbalance.
     Used for testing the rest of the pipeline without downloading the model.
     """
-    print("[dry-run] Generating fake Qwen-style routing (no model download)")
+    print(f"[dry-run] Generating fake Qwen-style routing T={T} (no model download)")
     rng = np.random.default_rng(0)
 
     embeddings = rng.standard_normal((T, d)).astype(np.float16)
@@ -317,8 +320,11 @@ def dry_run(T: int, K: int, E: int, d: int, out_dir: str) -> None:
     weights = (exp_l / exp_l.sum(axis=1, keepdims=True)).astype(np.float16)
 
     verify_routing(embeddings, assignments, weights, K, E)
-    save_routing(out_dir, embeddings, assignments, weights)
+    save_routing(out_dir, embeddings, assignments, weights, prefix=prefix)
     print("[dry-run] Complete. Outputs can be used as replacements for real model data.")
+
+SWEEP_SIZES = [2048, 4096, 8192, 16384]
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -327,45 +333,63 @@ def main():
         epilog=textwrap.dedent("""
             Examples
             --------
-              # Real model
+              # Real model, single size
               python data/extract_qwen_routing.py --topk 4 --out results
 
-              # Dry-run
-              python data/extract_qwen_routing.py --dry-run --topk 4 --out results
+              # Real model, all sizes for scaling benchmarks
+              python data/extract_qwen_routing.py --sweep --out results
+
+              # Dry-run (no model download), all sizes
+              python data/extract_qwen_routing.py --dry-run --sweep --out results
         """),
     )
     parser.add_argument("--model",      default="Qwen/Qwen1.5-MoE-A2.7B")
     parser.add_argument("--topk",       type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=2048,
-                        help="Max tokens to extract from the text corpus")
+                        help="Max tokens to extract (ignored with --sweep)")
     parser.add_argument("--out",        default="results")
     parser.add_argument("--device",     default=None, help="cuda | cpu (default: auto)")
     parser.add_argument("--dry-run",    action="store_true",
                         help="Skip model download, generate mock data instead")
+    parser.add_argument("--sweep",      action="store_true",
+                        help="Generate data at multiple T sizes for scaling benchmarks")
+    parser.add_argument("--n-sentences", type=int, default=2000,
+                        help="Number of WikiText sentences to load (increase for large T)")
     args = parser.parse_args()
 
+    sizes = SWEEP_SIZES if args.sweep else [args.max_tokens]
+
     if args.dry_run:
-        # We need E and d; use Qwen defaults
-        dry_run(T=args.max_tokens, K=args.topk, E=60, d=2048, out_dir=args.out)
+        E, d = 60, 2048
+        for T in sizes:
+            prefix = f"real_T{T}" if len(sizes) > 1 else "real"
+            dry_run(T=T, K=args.topk, E=E, d=d, out_dir=args.out, prefix=prefix)
+        print("\nDone ✓")
         return
 
     model, tokenizer, device = load_qwen_model(args.model, args.device)
-
-    # Infer E from gate
     gate = extract_layer_0_gate(model)
     E = gate.out_features
 
-    texts = load_wikitext_corpus(n_sentences=200)
-    embeddings, assignments, weights = compute_real_routing(
-        model, tokenizer, texts, K=args.topk,
-        device=device, max_tokens=args.max_tokens,
-    )
+    texts = load_wikitext_corpus(n_sentences=args.n_sentences)
 
-    ok = verify_routing(embeddings, assignments, weights, K=args.topk, E=E)
+    ok = True
+    for T in sizes:
+        prefix = f"real_T{T}" if len(sizes) > 1 else "real"
+        print(f"\n{'─'*60}")
+        print(f"  Extracting real routing: T={T}")
+        print(f"{'─'*60}")
+
+        embeddings, assignments, weights = compute_real_routing(
+            model, tokenizer, texts, K=args.topk,
+            device=device, max_tokens=T,
+        )
+
+        ok &= verify_routing(embeddings, assignments, weights, K=args.topk, E=E)
+        save_routing(args.out, embeddings, assignments, weights, prefix=prefix)
+
     if not ok:
         sys.exit(1)
-
-    save_routing(args.out, embeddings, assignments, weights)
     print("\nDone ✓")
 
 
