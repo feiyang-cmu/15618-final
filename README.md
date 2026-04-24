@@ -48,7 +48,7 @@ but Step 1 packing time stays constant, **packing fraction grows and becomes the
 │   ├── verify.cu           # Correctness harness: runs CPU reference + any IScatter, checks invariants
 │   ├── bench_scatter.cu    # Isolated scatter benchmark: auto-scales iters, reports min/p50/p90/p99/mean
 │   ├── bench_e2e.cu        # End-to-end single-GPU MoE layer: routing → IScatter → cuBLAS GEMM → unpack
-│   ├── bench_ep.cu         # 2-GPU Expert Parallelism benchmark: scatter + NCCL AllToAll dispatch/combine
+│   ├── bench_ep.cu         # Multi-GPU Expert Parallelism benchmark: scatter + NCCL AllToAll dispatch/combine
 │   └── grouped_gemm_test.cu # CUTLASS grouped GEMM vs sequential cuBLAS hgemm microbench (requires CUTLASS)
 │
 ├── data/
@@ -138,7 +138,7 @@ but Step 1 packing time stays constant, **packing fraction grows and becomes the
     then down-proj per expert). Measures per-stage latency breakdown.
 - **`bench_ep.cu`**
   - **Core Functions:** `rank_worker()`, `Barrier2`
-  - 2-GPU Expert Parallelism benchmark using NCCL. Two CPU threads each control one
+  - Multi-GPU Expert Parallelism benchmark using NCCL. Two CPU threads each control one
     GPU. Each GPU runs local scatter via `IScatter`, then NCCL `AllToAll` dispatches
     packed tokens to the GPU owning each expert, and a second `AllToAll` combines
     results back. Measures scatter, dispatch, and combine latency independently to
@@ -303,15 +303,15 @@ make ARCH=sm_75 \
 ./build/bin/bench_e2e syn_zipf_T2048
 ```
 
-### 7. 2-GPU Expert Parallelism benchmark
+### 7. Multi-GPU Expert Parallelism benchmark
 
-Requires 2 GPUs with P2P access and NCCL. Build with `NCCL=<path>` as shown above.
+Requires Multi-GPU with P2P access and NCCL. Build with `NCCL=<path>` as shown above.
 
 ```bash
-./build/bin/bench_ep --prefix=syn_uniform_T2048 --strategy=sort
-./build/bin/bench_ep --prefix=syn_zipf_T2048   --strategy=sort
-./build/bin/bench_ep --prefix=syn_uniform_T8192 --strategy=warp
-./build/bin/bench_ep --prefix=syn_zipf_T8192   --strategy=warp
+./build/bin/bench_ep --prefix=syn_uniform_T2048 --strategy=sort --n-gpus=4
+./build/bin/bench_ep --prefix=syn_zipf_T2048   --strategy=sort --n-gpus=4
+./build/bin/bench_ep --prefix=syn_uniform_T8192 --strategy=sort --n-gpus=4
+./build/bin/bench_ep --prefix=syn_zipf_T8192   --strategy=sort --n-gpus=4
 ```
  
 ### 8. Nsight Compute profiling
