@@ -161,7 +161,12 @@ def _run_ep(n_gpus: int, strategy: str):
 
 
 def _run_prefill(n_gpus: int, strategy: str):
-    """Multi-round prefill benchmark (bench_prefill)."""
+    """Multi-round prefill benchmark (bench_prefill).
+
+    Runs each (dist, strategy) twice: once serial (--overlap=0) and once
+    with comm/compute overlap (--overlap=1) so we can A/B compare wall
+    time and confirm the L2 checksum still matches.
+    """
     output = _gpu_info(n_gpus)
     ok, msg = _build()
     output += msg
@@ -174,12 +179,14 @@ def _run_prefill(n_gpus: int, strategy: str):
     for dist in ["uniform", "zipf"]:
         prefix = f"syn_{dist}_T{T}_N32"
         for s in strategies:
-            output += _run_cmd(
-                ["./build/bin/bench_prefill",
-                 f"--prefix={prefix}", f"--strategy={s}",
-                 f"--n-gpus={n_gpus}"],
-                f"bench_prefill {prefix} {s} ({n_gpus} GPUs)",
-            )
+            for ov in (0, 1):
+                tag = "overlap" if ov else "serial"
+                output += _run_cmd(
+                    ["./build/bin/bench_prefill",
+                     f"--prefix={prefix}", f"--strategy={s}",
+                     f"--n-gpus={n_gpus}", f"--overlap={ov}"],
+                    f"bench_prefill {prefix} {s} ({n_gpus} GPUs, {tag})",
+                )
 
     return output
 

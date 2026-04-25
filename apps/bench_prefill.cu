@@ -113,6 +113,7 @@ struct Config {
     int         n_gpus    = 0;
     int         warmup    = 2;
     int         repeats   = 5;
+    int         overlap   = 0;   // 0 = single-stream serial, 1 = 2-stream comm/compute overlap
 };
 
 Config parse(int argc, char** argv) {
@@ -132,6 +133,7 @@ Config parse(int argc, char** argv) {
         else if (k == "n-gpus")   c.n_gpus   = std::atoi(v.c_str());
         else if (k == "warmup")   c.warmup   = std::atoi(v.c_str());
         else if (k == "repeats")  c.repeats  = std::atoi(v.c_str());
+        else if (k == "overlap")  c.overlap  = std::atoi(v.c_str());
         else { std::fprintf(stderr, "unknown flag --%s\n", k.c_str()); std::exit(1); }
     }
     if (c.prefix.empty()) {
@@ -280,9 +282,23 @@ void rank_worker(
 
     auto scatter = moe::make_scatter(cfg.strategy);
 
-    cudaStream_t stream;
-    MOE_CUDA_CHECK(cudaStreamCreate(&stream));
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
+    // Two streams: compute (scatter + FFN) and comm (AllGather + AllToAll-V).
+    // For overlap=0 they're aliased to the same stream so the harness keeps
+    // the legacy single-stream behavior for an apples-to-apples baseline.
+    cudaStream_t s_cmp, s_com;
+    MOE_CUDA_CHECK(cudaStreamCreate(&s_cmp));
+    if (cfg.overlap) {
+        MOE_CUDA_CHECK(cudaStreamCreate(&s_com));
+    } else {
+        s_com = s_cmp;
+    }
+    CUBLAS_CHECK(cublasSetStream(cublas, s_cmp));
+
+    // Cross-stream events for handoff. Reused per round.
+    cudaEvent_t ev_scatter_done, ev_dispatch_done, ev_ffn_done;
+    MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_scatter_done,  cudaEventDisableTiming));
+    MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_dispatch_done, cudaEventDisableTiming));
+    MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_ffn_done,      cudaEventDisableTiming));
 
     __half alpha_h = __float2half(1.f), beta_h = __float2half(0.f);
 
@@ -292,36 +308,141 @@ void rank_worker(
     std::vector<int32_t> h_recv_off_tok(n_ranks + 1);  // token offsets in d_dispatch_recv
 
     // ── Lambda: run one full round ────────────────────────────────────────────
+    // Two paths:
+    //   serial   (cfg.overlap=0)  legacy single-stream with per-stage timers
+    //                             and inter-stage barriers. Reports per-stage
+    //                             breakdown.
+    //   overlap  (cfg.overlap=1)  2-stream pipeline. scatter+FFN on s_cmp,
+    //                             AllGather+dispatch+combine on s_com. Cross-
+    //                             stream events serialize within a round but
+    //                             allow cross-round overlap. No per-stage
+    //                             timers (would force host syncs that defeat
+    //                             pipelining); only round-level wall.
     auto run_round = [&](int round_idx, RoundResult* rr) {
         int32_t* d_asgn = d_asgn_local + (std::size_t)round_idx * TK_local;
         float*   d_wts  = d_wts_local  + (std::size_t)round_idx * TK_local;
 
+        if (cfg.overlap) {
+            // ── OVERLAP path ────────────────────────────────────────────────
+            // Stage 1: scatter on s_cmp
+            scatter->run(d_emb_local, d_asgn, d_wts, bufs, p, s_cmp);
+            MOE_CUDA_CHECK(cudaEventRecord(ev_scatter_done, s_cmp));
+
+            // Stage 2 (s_com): AllGather + sync + offsets + AllToAll-V dispatch
+            MOE_CUDA_CHECK(cudaStreamWaitEvent(s_com, ev_scatter_done, 0));
+            NCCL_CHECK(ncclAllGather(
+                bufs.expert_count, d_all_counts, p.E, ncclInt32, comm, s_com));
+            MOE_CUDA_CHECK(cudaMemcpyAsync(
+                h_all_counts.data(), d_all_counts,
+                (std::size_t)n_ranks * p.E * 4, cudaMemcpyDeviceToHost, s_com));
+            MOE_CUDA_CHECK(cudaStreamSynchronize(s_com));
+
+            h_send_off_tok[0] = 0;
+            for (int g = 0; g < n_ranks; ++g) {
+                int32_t s = 0;
+                for (int e = g * experts_per_gpu; e < (g + 1) * experts_per_gpu; ++e)
+                    s += h_all_counts[(std::size_t)rank * p.E + e];
+                h_send_off_tok[g + 1] = h_send_off_tok[g] + s;
+            }
+            h_recv_off_tok[0] = 0;
+            for (int g = 0; g < n_ranks; ++g) {
+                int32_t s = 0;
+                for (int e = rank * experts_per_gpu; e < (rank + 1) * experts_per_gpu; ++e)
+                    s += h_all_counts[(std::size_t)g * p.E + e];
+                h_recv_off_tok[g + 1] = h_recv_off_tok[g] + s;
+            }
+
+            NCCL_CHECK(ncclGroupStart());
+            for (int g = 0; g < n_ranks; ++g) {
+                std::size_t send_cnt =
+                    (std::size_t)(h_send_off_tok[g + 1] - h_send_off_tok[g]) * d_model;
+                std::size_t recv_cnt =
+                    (std::size_t)(h_recv_off_tok[g + 1] - h_recv_off_tok[g]) * d_model;
+                if (send_cnt > 0) {
+                    NCCL_CHECK(ncclSend(
+                        bufs.packed + (std::size_t)h_send_off_tok[g] * d_model,
+                        send_cnt, ncclHalf, g, comm, s_com));
+                }
+                if (recv_cnt > 0) {
+                    NCCL_CHECK(ncclRecv(
+                        d_dispatch_recv + (std::size_t)h_recv_off_tok[g] * d_model,
+                        recv_cnt, ncclHalf, g, comm, s_com));
+                }
+            }
+            NCCL_CHECK(ncclGroupEnd());
+            MOE_CUDA_CHECK(cudaEventRecord(ev_dispatch_done, s_com));
+
+            // Stage 3 (s_cmp): FFN — wait for dispatch
+            MOE_CUDA_CHECK(cudaStreamWaitEvent(s_cmp, ev_dispatch_done, 0));
+            std::size_t curr_tok = 0;
+            for (int g = 0; g < n_ranks; ++g) {
+                for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
+                    int e_global = rank * experts_per_gpu + e_local;
+                    int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
+                    if (cnt == 0) continue;
+
+                    const __half* A  = d_dispatch_recv + curr_tok * d_model;
+                    const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
+                    const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
+                    __half* mid      = d_ffn_tmp    + curr_tok * p.d_ffn;
+                    __half* eout     = d_expert_out + curr_tok * d_model;
+
+                    CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        p.d_ffn, cnt, d_model, &alpha_h,
+                        B1, p.d_ffn, A, d_model,
+                        &beta_h, mid, p.d_ffn));
+                    CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        d_model, cnt, p.d_ffn, &alpha_h,
+                        B2, d_model, mid, p.d_ffn,
+                        &beta_h, eout, d_model));
+
+                    curr_tok += cnt;
+                }
+            }
+            MOE_CUDA_CHECK(cudaEventRecord(ev_ffn_done, s_cmp));
+
+            // Stage 4 (s_com): combine — wait for FFN
+            MOE_CUDA_CHECK(cudaStreamWaitEvent(s_com, ev_ffn_done, 0));
+            NCCL_CHECK(ncclGroupStart());
+            for (int g = 0; g < n_ranks; ++g) {
+                std::size_t send_cnt =
+                    (std::size_t)(h_recv_off_tok[g + 1] - h_recv_off_tok[g]) * d_model;
+                std::size_t recv_cnt =
+                    (std::size_t)(h_send_off_tok[g + 1] - h_send_off_tok[g]) * d_model;
+                if (send_cnt > 0) {
+                    NCCL_CHECK(ncclSend(
+                        d_expert_out + (std::size_t)h_recv_off_tok[g] * d_model,
+                        send_cnt, ncclHalf, g, comm, s_com));
+                }
+                if (recv_cnt > 0) {
+                    NCCL_CHECK(ncclRecv(
+                        d_combine_recv + (std::size_t)h_send_off_tok[g] * d_model,
+                        recv_cnt, ncclHalf, g, comm, s_com));
+                }
+            }
+            NCCL_CHECK(ncclGroupEnd());
+            // No sync here — let next round queue work onto the streams.
+            // The outer rep loop syncs once at the end.
+            return;
+        }
+
+        // ── SERIAL path (legacy, for A/B comparison) ────────────────────────
         moe::CudaTimer ts, td, tf, tc;
 
-        // ── Stage 1: Local scatter ───────────────────────────────────────────
         barrier.wait();
-        ts.start(stream);
-        scatter->run(d_emb_local, d_asgn, d_wts, bufs, p, stream);
-        rr->scatter_ms = ts.stop_ms(stream);
+        ts.start(s_cmp);
+        scatter->run(d_emb_local, d_asgn, d_wts, bufs, p, s_cmp);
+        rr->scatter_ms = ts.stop_ms(s_cmp);
 
-        // ── Stage 2: AllGather counts + AllToAll-V dispatch ──────────────────
         barrier.wait();
-        td.start(stream);
-
-        // 2a. AllGather every rank's expert_count
+        td.start(s_cmp);
         NCCL_CHECK(ncclAllGather(
-            bufs.expert_count, d_all_counts, p.E, ncclInt32, comm, stream));
-
-        // 2b. Pull counts to host so we can compute per-pair send/recv sizes.
-        //     This forces a stream sync between AllGather and ncclSend/Recv,
-        //     which is unavoidable since NCCL needs host-known counts.
+            bufs.expert_count, d_all_counts, p.E, ncclInt32, comm, s_cmp));
         MOE_CUDA_CHECK(cudaMemcpyAsync(
             h_all_counts.data(), d_all_counts,
-            (std::size_t)n_ranks * p.E * 4, cudaMemcpyDeviceToHost, stream));
-        MOE_CUDA_CHECK(cudaStreamSynchronize(stream));
+            (std::size_t)n_ranks * p.E * 4, cudaMemcpyDeviceToHost, s_cmp));
+        MOE_CUDA_CHECK(cudaStreamSynchronize(s_cmp));
 
-        // 2c. Compute send offsets: this GPU's local packed tokens going to
-        //     rank g are those for experts [g*epp, (g+1)*epp).
         h_send_off_tok[0] = 0;
         for (int g = 0; g < n_ranks; ++g) {
             int32_t s = 0;
@@ -329,9 +450,6 @@ void rank_worker(
                 s += h_all_counts[(std::size_t)rank * p.E + e];
             h_send_off_tok[g + 1] = h_send_off_tok[g] + s;
         }
-
-        // 2d. Compute recv offsets: from sender g, tokens for our local
-        //     experts [rank*epp, (rank+1)*epp).
         h_recv_off_tok[0] = 0;
         for (int g = 0; g < n_ranks; ++g) {
             int32_t s = 0;
@@ -340,7 +458,6 @@ void rank_worker(
             h_recv_off_tok[g + 1] = h_recv_off_tok[g] + s;
         }
 
-        // 2e. AllToAll-V via grouped ncclSend/ncclRecv with per-pair counts.
         NCCL_CHECK(ncclGroupStart());
         for (int g = 0; g < n_ranks; ++g) {
             std::size_t send_cnt =
@@ -350,24 +467,19 @@ void rank_worker(
             if (send_cnt > 0) {
                 NCCL_CHECK(ncclSend(
                     bufs.packed + (std::size_t)h_send_off_tok[g] * d_model,
-                    send_cnt, ncclHalf, g, comm, stream));
+                    send_cnt, ncclHalf, g, comm, s_cmp));
             }
             if (recv_cnt > 0) {
                 NCCL_CHECK(ncclRecv(
                     d_dispatch_recv + (std::size_t)h_recv_off_tok[g] * d_model,
-                    recv_cnt, ncclHalf, g, comm, stream));
+                    recv_cnt, ncclHalf, g, comm, s_cmp));
             }
         }
         NCCL_CHECK(ncclGroupEnd());
-        MOE_CUDA_CHECK(cudaStreamSynchronize(stream));
-        rr->dispatch_ms = td.stop_ms(stream);
+        MOE_CUDA_CHECK(cudaStreamSynchronize(s_cmp));
+        rr->dispatch_ms = td.stop_ms(s_cmp);
 
-        // ── Stage 3: FFN on dispatched data ─────────────────────────────────
-        // Layout of d_dispatch_recv: chunks from each sender concatenated.
-        // Within sender g's chunk, tokens are sorted by expert (g's local
-        // scatter ordering), covering experts [rank*epp, (rank+1)*epp).
-        // Run one cublasHgemm pair per (sender, local_expert).
-        tf.start(stream);
+        tf.start(s_cmp);
         std::size_t curr_tok = 0;
         for (int g = 0; g < n_ranks; ++g) {
             for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
@@ -393,34 +505,30 @@ void rank_worker(
                 curr_tok += cnt;
             }
         }
-        rr->ffn_ms = tf.stop_ms(stream);
+        rr->ffn_ms = tf.stop_ms(s_cmp);
 
-        // ── Stage 4: AllToAll-V combine (reverse of dispatch) ────────────────
-        // Send d_expert_out chunks back to the GPU that originally sent them.
         barrier.wait();
-        tc.start(stream);
+        tc.start(s_cmp);
         NCCL_CHECK(ncclGroupStart());
         for (int g = 0; g < n_ranks; ++g) {
-            // Send back to g: the chunk we received from g, now FFN'd
             std::size_t send_cnt =
                 (std::size_t)(h_recv_off_tok[g + 1] - h_recv_off_tok[g]) * d_model;
-            // Receive from g: the chunk we originally sent to g, now FFN'd
             std::size_t recv_cnt =
                 (std::size_t)(h_send_off_tok[g + 1] - h_send_off_tok[g]) * d_model;
             if (send_cnt > 0) {
                 NCCL_CHECK(ncclSend(
                     d_expert_out + (std::size_t)h_recv_off_tok[g] * d_model,
-                    send_cnt, ncclHalf, g, comm, stream));
+                    send_cnt, ncclHalf, g, comm, s_cmp));
             }
             if (recv_cnt > 0) {
                 NCCL_CHECK(ncclRecv(
                     d_combine_recv + (std::size_t)h_send_off_tok[g] * d_model,
-                    recv_cnt, ncclHalf, g, comm, stream));
+                    recv_cnt, ncclHalf, g, comm, s_cmp));
             }
         }
         NCCL_CHECK(ncclGroupEnd());
-        MOE_CUDA_CHECK(cudaStreamSynchronize(stream));
-        rr->combine_ms = tc.stop_ms(stream);
+        MOE_CUDA_CHECK(cudaStreamSynchronize(s_cmp));
+        rr->combine_ms = tc.stop_ms(s_cmp);
 
         rr->total_ms = rr->scatter_ms + rr->dispatch_ms + rr->ffn_ms + rr->combine_ms;
         barrier.wait();
@@ -441,13 +549,20 @@ void rank_worker(
         moe::CudaTimer t_total;
 
         barrier.wait();
-        t_total.start(stream);
+        t_total.start(s_cmp);
 
         for (int r = 0; r < N_rounds; ++r) {
             run_round(r, &all_round_results[rep][r]);
         }
 
-        total_times[rep] = t_total.stop_ms(stream);
+        // In overlap mode, the inner loop never syncs s_com; combine work for
+        // the last rounds is still in flight. Sync both streams now so the
+        // total timer captures the full pipeline drain.
+        if (cfg.overlap) {
+            MOE_CUDA_CHECK(cudaStreamSynchronize(s_com));
+            MOE_CUDA_CHECK(cudaStreamSynchronize(s_cmp));
+        }
+        total_times[rep] = t_total.stop_ms(s_cmp);
     }
 
     // ── Median over repetitions ──────────────────────────────────────────────
@@ -488,7 +603,11 @@ void rank_worker(
     cudaFree(d_all_counts);
     cudaFree(d_dispatch_recv); cudaFree(d_combine_recv);
     cudaFree(d_W1); cudaFree(d_W2); cudaFree(d_ffn_tmp); cudaFree(d_expert_out);
-    cudaStreamDestroy(stream);
+    cudaEventDestroy(ev_scatter_done);
+    cudaEventDestroy(ev_dispatch_done);
+    cudaEventDestroy(ev_ffn_done);
+    cudaStreamDestroy(s_cmp);
+    if (cfg.overlap) cudaStreamDestroy(s_com);
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -510,8 +629,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("\n== bench_prefill  strategy=%s  prefix=%s  n_gpus=%d ==\n\n",
-                cfg.strategy.c_str(), cfg.prefix.c_str(), n_ranks);
+    std::printf("\n== bench_prefill  strategy=%s  prefix=%s  n_gpus=%d  overlap=%d ==\n\n",
+                cfg.strategy.c_str(), cfg.prefix.c_str(), n_ranks, cfg.overlap);
 
     // ── NCCL init ─────────────────────────────────────────────────────────────
     std::vector<ncclComm_t> comms(n_ranks);
@@ -555,27 +674,34 @@ int main(int argc, char** argv) {
     std::printf("  warmup=%d  repeats=%d  rounds=%d  (median total over repeats, avg over %d GPUs)\n\n",
                 cfg.warmup, cfg.repeats, N_rounds, n_ranks);
 
-    std::printf("  Per-round averages:\n");
-    std::printf("    scatter:   %8.3f ms  (%5.1f%%)\n",
-                avg_scatter,  avg_scatter  / avg_round * 100.f);
-    std::printf("    dispatch:  %8.3f ms  (%5.1f%%)  [AllGather + AllToAll-V]\n",
-                avg_dispatch, avg_dispatch / avg_round * 100.f);
-    std::printf("    FFN:       %8.3f ms  (%5.1f%%)\n",
-                avg_ffn,      avg_ffn      / avg_round * 100.f);
-    std::printf("    combine:   %8.3f ms  (%5.1f%%)  [AllToAll-V reverse]\n",
-                avg_combine,  avg_combine  / avg_round * 100.f);
-    std::printf("    ─────────────────────────────────\n");
-    std::printf("    round:     %8.3f ms\n\n", avg_round);
+    if (!cfg.overlap) {
+        std::printf("  Per-round averages:\n");
+        std::printf("    scatter:   %8.3f ms  (%5.1f%%)\n",
+                    avg_scatter,  avg_scatter  / avg_round * 100.f);
+        std::printf("    dispatch:  %8.3f ms  (%5.1f%%)  [AllGather + AllToAll-V]\n",
+                    avg_dispatch, avg_dispatch / avg_round * 100.f);
+        std::printf("    FFN:       %8.3f ms  (%5.1f%%)\n",
+                    avg_ffn,      avg_ffn      / avg_round * 100.f);
+        std::printf("    combine:   %8.3f ms  (%5.1f%%)  [AllToAll-V reverse]\n",
+                    avg_combine,  avg_combine  / avg_round * 100.f);
+        std::printf("    ─────────────────────────────────\n");
+        std::printf("    round:     %8.3f ms\n\n", avg_round);
+    } else {
+        std::printf("  Per-stage breakdown not measured in overlap mode\n"
+                    "  (sub-stage timers would force host syncs that defeat pipelining).\n\n");
+    }
 
     std::printf("  Full prefill (%d rounds):\n", N_rounds);
     std::printf("    total:     %8.3f ms\n", total_ms);
     std::printf("    throughput: %.1f rounds/s\n", N_rounds / (total_ms / 1000.f));
     std::printf("    avg round:  %8.3f ms  (from total / N)\n\n", total_ms / N_rounds);
 
-    float ep_overhead = avg_scatter + avg_dispatch + avg_combine;
-    std::printf("  EP overhead (scatter+dispatch+combine): %.3f ms (%.1f%% of round)\n",
-                ep_overhead, ep_overhead / avg_round * 100.f);
-    std::printf("  FFN fraction: %.1f%%\n\n", avg_ffn / avg_round * 100.f);
+    if (!cfg.overlap) {
+        float ep_overhead = avg_scatter + avg_dispatch + avg_combine;
+        std::printf("  EP overhead (scatter+dispatch+combine): %.3f ms (%.1f%% of round)\n",
+                    ep_overhead, ep_overhead / avg_round * 100.f);
+        std::printf("  FFN fraction: %.1f%%\n\n", avg_ffn / avg_round * 100.f);
+    }
 
     // ── L2-norm checksum (round 0 only) — for cross-config correctness check
     double total_sum_sq = 0.0;
