@@ -13,6 +13,7 @@ std::unique_ptr<IScatter> make_scatter(const std::string& name) {
     if (name == "sort")   return make_sort_scatter();
     if (name == "warp")   return make_warp_scatter();
     if (name == "vec")    return make_vec_scatter();
+    if (name == "csort")  return make_csort_scatter();
     return nullptr;
 }
 

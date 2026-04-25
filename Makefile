@@ -54,7 +54,8 @@ SCATTER_SRCS := src/scatter/factory.cu \
                 src/scatter/scatter_atomic.cu \
                 src/scatter/scatter_sort.cu \
                 src/scatter/scatter_warp.cu \
-                src/scatter/scatter_vec.cu
+                src/scatter/scatter_vec.cu \
+                src/scatter/scatter_csort.cu
 SCATTER_OBJS := $(patsubst src/%.cu,$(OBJ_DIR)/%.o,$(SCATTER_SRCS))
 
 # Apps (each compiles + links into its own binary).
