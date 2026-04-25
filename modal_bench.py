@@ -31,7 +31,7 @@ _base_image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12"
     )
-    .apt_install("git")
+    .apt_install("git", "cuda-nsight-compute-12-4", "cuda-nsight-systems-12-4")
     .run_commands(
         "apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev"
     )
@@ -79,7 +79,7 @@ MAKE_CMD = [
 # T scales with GPU count for constant all-to-all chunk size
 GPU_TO_T = {1: 2048, 2: 2048, 4: 4096, 8: 8192}
 
-STRATEGIES = ["atomic", "sort", "warp"]
+STRATEGIES = ["atomic", "sort", "warp", "vec"]
 
 
 def _run_cmd(cmd, label=""):
@@ -234,12 +234,86 @@ def _run_real(n_gpus: int, strategy: str):
     return output
 
 
+def _run_profile(strategy: str):
+    """NCU profile of bench_scatter for the chosen strategy on uniform + zipf.
+
+    Captures key metrics: SM/memory throughput, occupancy, stall reasons.
+    Prints a per-kernel summary so we can see where the time goes.
+    """
+    import subprocess
+    output = _gpu_info(1)
+    ok, msg = _build()
+    output += msg
+    if not ok:
+        return output
+
+    # Locate ncu (apt installs to /opt/nvidia/nsight-compute/<ver>/ncu)
+    ncu_paths = [
+        "/usr/local/cuda/bin/ncu",
+        "/opt/nvidia/nsight-compute/2024.1.1/ncu",
+        "/usr/bin/ncu",
+        "ncu",
+    ]
+    ncu = None
+    for path in ncu_paths:
+        try:
+            r = subprocess.run([path, "--version"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                ncu = path
+                output += f"using ncu at: {path}\n{r.stdout.splitlines()[0]}\n\n"
+                break
+        except FileNotFoundError:
+            continue
+    if ncu is None:
+        # Try shell-search
+        r = subprocess.run(
+            ["bash", "-lc", "find /opt /usr -name ncu -type f 2>/dev/null | head -5"],
+            capture_output=True, text=True,
+        )
+        output += f"ncu not found. find result:\n{r.stdout}\n"
+        return output
+
+    # Diagnostics
+    output += "\n--- diagnostics ---\n"
+    for cmd in [
+        "id",
+        "cat /proc/driver/nvidia/params 2>&1 | grep -iE 'profil|admin' | head -5 || true",
+        "nvidia-smi --query-gpu=persistence_mode,compute_mode --format=csv",
+        "find /opt /usr -name 'ncu' -o -name 'nsys' 2>/dev/null | head -10",
+    ]:
+        r = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True)
+        output += f"$ {cmd}\n{r.stdout}{r.stderr}\n"
+
+    # Locate nsys
+    r = subprocess.run(["bash", "-lc", "which nsys || find /opt /usr -name nsys -type f 2>/dev/null | head -1"],
+                       capture_output=True, text=True)
+    nsys = r.stdout.strip() or None
+    output += f"nsys found at: {nsys}\n\n"
+
+    # Per-stage breakdown via bench_scatter's built-in ScatterTimings reporting
+    output += "\n--- per-stage breakdown (no profiler) ---\n"
+    strategies = [strategy] if strategy != "all" else STRATEGIES
+    for dist in ["uniform", "zipf"]:
+        for s in strategies:
+            output += _run_cmd(
+                ["./build/bin/bench_scatter",
+                 f"--prefix=syn_{dist}_T2048", "--E=64", f"--strategy={s}",
+                 "--iters=200", "--warmup=20"],
+                f"breakdown {dist} {s}",
+            )
+
+    return output
+
+
 # ── Per-GPU-count functions ───────────────────────────────────────────────────
 
 @app.function(image=image, gpu="A100", timeout=900)
 def bench_1gpu(strategy: str = "all", mode: str = "ep"):
     if mode == "prefill":
         return _run_prefill(1, strategy)
+    if mode == "profile":
+        return _run_profile(strategy)
     return _run_ep(1, strategy)
 
 

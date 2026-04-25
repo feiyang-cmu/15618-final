@@ -220,15 +220,21 @@ int main(int argc, char** argv) {
 
     // 5. Timed loop. Per-iter cudaEvent pair, pre-allocated.
     //    If cfg.iters == 0 we auto-scale until total >= cfg.min_total_ms.
-    auto time_iters = [&](int N) {
+    //    Also accumulates per-stage breakdown via ScatterTimings (only the
+    //    stages the strategy reports — others stay 0).
+    struct StageAcc {
+        double count = 0, prefix = 0, sort = 0, gather = 0, total = 0;
+    };
+    auto time_iters = [&](int N, StageAcc* stages) {
         std::vector<cudaEvent_t> starts(N), stops(N);
+        std::vector<moe::ScatterTimings> per_iter(N);
         for (int i = 0; i < N; ++i) {
             MOE_CUDA_CHECK(cudaEventCreate(&starts[i]));
             MOE_CUDA_CHECK(cudaEventCreate(&stops[i]));
         }
         for (int i = 0; i < N; ++i) {
             MOE_CUDA_CHECK(cudaEventRecord(starts[i], d.stream));
-            scatter->run(d.d_emb, d.d_asgn, d.d_wts, d.bufs, p, d.stream);
+            per_iter[i] = scatter->run(d.d_emb, d.d_asgn, d.d_wts, d.bufs, p, d.stream);
             MOE_CUDA_CHECK(cudaEventRecord(stops[i], d.stream));
         }
         MOE_CUDA_CHECK(cudaStreamSynchronize(d.stream));
@@ -236,6 +242,16 @@ int main(int argc, char** argv) {
         std::vector<float> ms(N);
         for (int i = 0; i < N; ++i) {
             MOE_CUDA_CHECK(cudaEventElapsedTime(&ms[i], starts[i], stops[i]));
+        }
+        if (stages) {
+            *stages = StageAcc{};
+            for (const auto& t : per_iter) {
+                stages->count  += t.count_ms;
+                stages->prefix += t.prefix_ms;
+                stages->sort   += t.sort_ms;
+                stages->gather += t.gather_ms;
+                stages->total  += t.total_ms;
+            }
         }
         for (int i = 0; i < N; ++i) {
             cudaEventDestroy(starts[i]); cudaEventDestroy(stops[i]);
@@ -245,8 +261,9 @@ int main(int argc, char** argv) {
 
     int N = cfg.iters > 0 ? cfg.iters : 50;  // start point for auto-scale
     std::vector<float> samples;
+    StageAcc stages{};
     while (true) {
-        samples = time_iters(N);
+        samples = time_iters(N, &stages);
         float total = std::accumulate(samples.begin(), samples.end(), 0.f);
         if (cfg.iters > 0) break;          // fixed count requested
         if (total >= cfg.min_total_ms) break;
@@ -260,6 +277,15 @@ int main(int argc, char** argv) {
     std::printf("   iters=%zu  warmup=%d  total=%.2fms\n", samples.size(), cfg.warmup, total);
     std::printf("   time (ms) — min %.4f  p50 %.4f  p90 %.4f  p99 %.4f  mean %.4f  stdev %.4f\n",
                 st.min, st.p50, st.p90, st.p99, st.mean, st.stdev);
+
+    // Per-stage breakdown (only stages the strategy reports are non-zero).
+    int M = (int)samples.size();
+    double mc = stages.count / M, ms_sort = stages.sort / M, mp = stages.prefix / M,
+           mg = stages.gather / M, mt = stages.total / M;
+    if (mt > 0.0) {
+        std::printf("   per-stage (mean ms)  count=%.4f  sort=%.4f  prefix=%.4f  gather=%.4f  | sum=%.4f  reported_total=%.4f\n",
+                    mc, ms_sort, mp, mg, mc + ms_sort + mp + mg, mt);
+    }
 
     // Effective bandwidth based on packed-row data movement (read emb, write packed).
     double bytes = 2.0 * (double)TK * p.d_model * sizeof(std::uint16_t);
