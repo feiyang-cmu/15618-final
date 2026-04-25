@@ -224,7 +224,46 @@ def verify_routing(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sweep: three input sizes for benchmarking across workload scales
+# Multi-round generation: N rounds of different routing for prefill benchmark
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gen_multi_round(
+    gen_fn,
+    N: int,
+    T: int,
+    K: int,
+    E: int,
+    d: int,
+    base_seed: int = 42,
+    **kwargs,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate N rounds of routing decisions with different seeds.
+    Embeddings are shared (same tokens across MoE layers).
+    Assignments and weights differ per round (each layer routes differently).
+
+    Returns
+    -------
+    embeddings   float16  [T, d]       shared across rounds
+    assignments  int32    [N, T, K]    per-round expert assignments
+    weights      float16  [N, T, K]    per-round routing weights
+    """
+    all_asgn = []
+    all_wts  = []
+    shared_emb = None
+
+    for r in range(N):
+        emb, asgn, w = gen_fn(T, K, E, d, seed=base_seed + r, **kwargs)
+        if shared_emb is None:
+            shared_emb = emb
+        all_asgn.append(asgn)
+        all_wts.append(w)
+
+    return shared_emb, np.stack(all_asgn), np.stack(all_wts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sweep: input sizes for benchmarking across workload scales
 # ─────────────────────────────────────────────────────────────────────────────
 
 SWEEP_SIZES = {
@@ -252,6 +291,8 @@ if __name__ == "__main__":
                         help="Which distribution(s) to generate")
     parser.add_argument("--sweep",   action="store_true",
                         help="Generate small/medium/large sizes (ignores --tokens)")
+    parser.add_argument("--rounds",  type=int,   default=0,
+                        help="Generate multi-round data with N rounds (0 = single-round only)")
     parser.add_argument("--out",     type=str,   default="results",
                         help="Output directory")
     args = parser.parse_args()
@@ -284,6 +325,28 @@ if __name__ == "__main__":
             emb, asgn, w = gen_zipf_routing(T, K, E, d, alpha=args.alpha, seed=args.seed)
             ok &= verify_routing(f"Zipf T={T}", emb, asgn, w, T, K, E, d)
             save_routing(args.out, f"syn_zipf{tag}", emb, asgn, w)
+
+    # Multi-round data for prefill benchmarks
+    if args.rounds > 0:
+        N = args.rounds
+        for T, size_label in runs:
+            tag = f"_T{T}" if size_label else ""
+
+            print(f"\n{'─'*60}")
+            print(f"Multi-round: N={N}  T={T}  K={K}  E={E}  d={d}")
+            print(f"{'─'*60}")
+
+            if args.dist in ("uniform", "both"):
+                emb, asgn, w = gen_multi_round(
+                    gen_uniform_routing, N, T, K, E, d, base_seed=args.seed)
+                save_routing(args.out, f"syn_uniform{tag}_N{N}", emb, asgn, w)
+                print(f"  assignments shape: {asgn.shape}  (N={N} rounds)")
+
+            if args.dist in ("zipf", "both"):
+                emb, asgn, w = gen_multi_round(
+                    gen_zipf_routing, N, T, K, E, d, base_seed=args.seed)
+                save_routing(args.out, f"syn_zipf{tag}_N{N}", emb, asgn, w)
+                print(f"  assignments shape: {asgn.shape}  (N={N} rounds)")
 
     print(f"\n{'='*60}")
     print("  All checks passed ✓" if ok else "  SOME CHECKS FAILED ✗")

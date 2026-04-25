@@ -62,16 +62,36 @@ NpyArray load_npy(const std::string& path) {
     auto q2 = header.find('\'', q1 + 1);
     arr.dtype = header.substr(q1 + 1, q2 - q1 - 1);
 
-    // Parse 'shape': (R, C)  — 2-D only
+    // Parse 'shape': (R, C) or (N, R, C) — 2-D or 3-D
+    // For 3-D, flatten to rows = N*R, cols = C so downstream code can index
+    // as round * R * C into the flat buffer.
     auto s_pos = header.find("'shape':");
     if (s_pos == std::string::npos) die("no shape", path);
     auto lp = header.find('(', s_pos);
     auto rp = header.find(')', lp);
     std::string shape_str = header.substr(lp + 1, rp - lp - 1);
-    auto comma = shape_str.find(',');
-    if (comma == std::string::npos) die("non-2D shape", path);
-    arr.rows = std::strtoul(shape_str.substr(0, comma).c_str(), nullptr, 10);
-    arr.cols = std::strtoul(shape_str.substr(comma + 1).c_str(), nullptr, 10);
+
+    // Count commas to determine dimensionality
+    int n_commas = 0;
+    for (char c : shape_str) if (c == ',') n_commas++;
+
+    if (n_commas == 1) {
+        // 2-D: (rows, cols)
+        auto comma = shape_str.find(',');
+        arr.rows = std::strtoul(shape_str.substr(0, comma).c_str(), nullptr, 10);
+        arr.cols = std::strtoul(shape_str.substr(comma + 1).c_str(), nullptr, 10);
+    } else if (n_commas == 2) {
+        // 3-D: (N, rows, cols) → flatten to (N*rows, cols)
+        auto c1 = shape_str.find(',');
+        auto c2 = shape_str.find(',', c1 + 1);
+        std::size_t dim0 = std::strtoul(shape_str.substr(0, c1).c_str(), nullptr, 10);
+        std::size_t dim1 = std::strtoul(shape_str.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10);
+        std::size_t dim2 = std::strtoul(shape_str.substr(c2 + 1).c_str(), nullptr, 10);
+        arr.rows = dim0 * dim1;
+        arr.cols = dim2;
+    } else {
+        die("unsupported shape (need 2-D or 3-D)", path);
+    }
 
     std::size_t elt = arr.elt_bytes();
     if (elt == 0) {
