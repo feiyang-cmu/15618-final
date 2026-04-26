@@ -111,8 +111,8 @@ struct Config {
     std::string strategy  = "sort";
     int         E_cli     = 64;
     int         n_gpus    = 0;
-    int         warmup    = 2;
-    int         repeats   = 5;
+    int         warmup    = 3;
+    int         repeats   = 9;   // odd, larger N → stabler median against cloud noise
     int         overlap   = 0;   // 0 = single-stream serial, 1 = 2-stream comm/compute overlap
     int         chunks    = 1;   // when overlap=1: 1 = unchunked, K>1 = K-chunk dispatch (1F1B-style)
 };
