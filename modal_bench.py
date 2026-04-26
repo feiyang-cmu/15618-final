@@ -48,24 +48,36 @@ _base_image = (
     )
 )
 
-# add_local_dir must be last (Modal requirement)
-image = _base_image.add_local_dir(
-    ".",
-    remote_path="/workspace",
-    ignore=[".git", "build/", "third_party/", "analysis/", "**/__pycache__"],
-)
+# Local-tree mount: prefer Modal 1.x add_local_dir, fall back to Modal 0.65 Mount.
+_LOCAL_IGNORE = [".git", "build/", "third_party/", "analysis/", "**/__pycache__"]
 
-# Image with PyTorch + transformers for real Qwen trace extraction
-# pip_install before add_local_dir
-image_torch = (
-    _base_image
-    .pip_install("torch", "transformers", "datasets", "numpy", "accelerate")
-    .add_local_dir(
+if hasattr(_base_image, "add_local_dir"):
+    # Modal 1.x: add_local_dir must be the last image step.
+    image = _base_image.add_local_dir(
+        ".", remote_path="/workspace", ignore=_LOCAL_IGNORE,
+    )
+    image_torch = (
+        _base_image
+        .pip_install("torch", "transformers", "datasets", "numpy", "accelerate")
+        .add_local_dir(".", remote_path="/workspace", ignore=_LOCAL_IGNORE)
+    )
+    _MOUNTS = []  # add_local_dir bakes the mount into the image
+else:
+    # Modal 0.65: pre-1.x API uses Mount.from_local_dir + mounts=[...] on
+    # @app.function. Fall back so the script works on the older client too.
+    image = _base_image
+    image_torch = _base_image.pip_install(
+        "torch", "transformers", "datasets", "numpy", "accelerate"
+    )
+    _local_mount = modal.Mount.from_local_dir(
         ".",
         remote_path="/workspace",
-        ignore=[".git", "build/", "third_party/", "analysis/", "**/__pycache__"],
+        condition=lambda p: not any(
+            s in p for s in (".git/", "/build/", "/third_party/",
+                              "/analysis/", "__pycache__")
+        ),
     )
-)
+    _MOUNTS = [_local_mount]
 
 # ── Shared build + bench logic ────────────────────────────────────────────────
 
@@ -188,23 +200,25 @@ def _run_prefill(n_gpus: int, strategy: str):
         # `atomic` is the true naive baseline (per-thread atomic + per-thread
         # d-element copy loop) — what a from-scratch implementation looks like.
         # All speedups in the report are claimed against this baseline.
+        # (strategy, overlap, chunks, ffn, label)
         chain = [
-            ("atomic", 0, 1, "naive baseline (atomic + serial)"),
-            ("warp",   0, 1, "+ warp gather (radix sort + warp-per-row)"),
-            ("vec",    0, 1, "+ uint4 (vectorized gather)"),
-            ("csort",  0, 1, "+ csort (counting sort, replace radix + bounds)"),
-            ("csort",  1, 1, "+ overlap (2-stream comm/compute)"),
-            ("csort",  1, 2, "+ chunked dispatch K=2 (1F1B intra-round)"),
-            ("csort",  1, 4, "+ chunked dispatch K=4"),
+            ("atomic", 0, 1, "cublas",  "naive baseline (atomic + serial)"),
+            ("warp",   0, 1, "cublas",  "+ warp gather (radix sort + warp-per-row)"),
+            ("vec",    0, 1, "cublas",  "+ uint4 (vectorized gather)"),
+            ("csort",  0, 1, "cublas",  "+ csort (counting sort, replace radix + bounds)"),
+            ("csort",  1, 1, "cublas",  "+ overlap (2-stream comm/compute)"),
+            ("csort",  1, 2, "cublas",  "+ chunked dispatch K=2 (1F1B intra-round)"),
+            ("csort",  1, 4, "cublas",  "+ chunked dispatch K=4"),
+            ("csort",  1, 1, "grouped", "+ grouped FFN (CUTLASS GroupedGemm, replaces per-expert hgemm loop)"),
         ]
         for dist in ["uniform", "zipf"]:
             prefix = f"syn_{dist}_T{T}_N32"
-            for s, ov, ch, label in chain:
+            for s, ov, ch, ffn, label in chain:
                 output += _run_cmd(
                     ["./build/bin/bench_prefill",
                      f"--prefix={prefix}", f"--strategy={s}",
                      f"--n-gpus={n_gpus}", f"--overlap={ov}",
-                     f"--chunks={ch}"],
+                     f"--chunks={ch}", f"--ffn={ffn}"],
                     f"prefill {dist}  {label}",
                 )
         return output
@@ -424,7 +438,7 @@ def _run_blocksparse(strategy: str):
 
 # ── Per-GPU-count functions ───────────────────────────────────────────────────
 
-@app.function(image=image, gpu="A100", timeout=900)
+@app.function(image=image, gpu="A100", timeout=900, mounts=_MOUNTS)
 def bench_1gpu(strategy: str = "all", mode: str = "ep"):
     if mode == "prefill":
         return _run_prefill(1, strategy)
@@ -439,7 +453,7 @@ def bench_1gpu(strategy: str = "all", mode: str = "ep"):
     return _run_ep(1, strategy)
 
 
-@app.function(image=image, gpu="A100:2", timeout=900)
+@app.function(image=image, gpu="A100:2", timeout=900, mounts=_MOUNTS)
 def bench_2gpu(strategy: str = "all", mode: str = "ep"):
     if mode == "prefill":
         return _run_prefill(2, strategy)
@@ -448,7 +462,7 @@ def bench_2gpu(strategy: str = "all", mode: str = "ep"):
     return _run_ep(2, strategy)
 
 
-@app.function(image=image, gpu="A100:4", timeout=1200)
+@app.function(image=image, gpu="A100:4", timeout=1200, mounts=_MOUNTS)
 def bench_4gpu(strategy: str = "all", mode: str = "ep"):
     if mode == "prefill":
         return _run_prefill(4, strategy)
@@ -457,7 +471,7 @@ def bench_4gpu(strategy: str = "all", mode: str = "ep"):
     return _run_ep(4, strategy)
 
 
-@app.function(image=image, gpu="A100:8", timeout=1800)
+@app.function(image=image, gpu="A100:8", timeout=1800, mounts=_MOUNTS)
 def bench_8gpu(strategy: str = "all", mode: str = "ep"):
     if mode == "prefill":
         return _run_prefill(8, strategy)
@@ -466,12 +480,12 @@ def bench_8gpu(strategy: str = "all", mode: str = "ep"):
     return _run_ep(8, strategy)
 
 
-@app.function(image=image_torch, gpu="A100", timeout=1200)
+@app.function(image=image_torch, gpu="A100", timeout=1200, mounts=_MOUNTS)
 def bench_real_1gpu(strategy: str = "all"):
     return _run_real(1, strategy)
 
 
-@app.function(image=image_torch, gpu="A100:2", timeout=1200)
+@app.function(image=image_torch, gpu="A100:2", timeout=1200, mounts=_MOUNTS)
 def bench_real_2gpu(strategy: str = "all"):
     return _run_real(2, strategy)
 

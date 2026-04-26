@@ -91,7 +91,7 @@ $(BIN_DIR)/grouped_gemm_test:  EXTRA_INC  := $(CUTLASS_INC)
 $(BIN_DIR)/bench_ep:           LINK_EXTRA := $(NCCL_LINK)
 $(BIN_DIR)/bench_ep:           EXTRA_INC  := $(NCCL_INC)
 $(BIN_DIR)/bench_prefill:      LINK_EXTRA := $(CUBLAS_LINK) $(NCCL_LINK) $(NVTX_LINK)
-$(BIN_DIR)/bench_prefill:      EXTRA_INC  := $(NCCL_INC)
+$(BIN_DIR)/bench_prefill:      EXTRA_INC  := $(NCCL_INC) $(CUTLASS_INC)
 $(BIN_DIR)/bench_blocksparse:  LINK_EXTRA := $(CUBLAS_LINK)
 
 $(BIN_DIR)/%: apps/%.cu $(SCATTER_OBJS) $(COMMON_OBJS)

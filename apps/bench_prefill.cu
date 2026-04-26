@@ -28,6 +28,9 @@
 #include <nccl.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/gemm/device/gemm_grouped.h>
+#include <cutlass/gemm/kernel/default_gemm_grouped.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,6 +64,142 @@
             std::exit(1);                                                       \
         }                                                                       \
     } while (0)
+
+// ── CUTLASS Grouped GEMM (sm_80, fp16/fp16/fp16, RowMajor) ──────────────────
+// Tile 128×256×32 / warp 64×64 — best zipf result on A100 retest (1.22×).
+// Used optionally for the W1 and W2 FFN matmuls when --ffn=grouped.
+
+using _GG_ElA   = cutlass::half_t;
+using _GG_ElB   = cutlass::half_t;
+using _GG_ElC   = cutlass::half_t;
+using _GG_ElAcc = float;
+
+using GroupedGemm_t = cutlass::gemm::device::GemmGrouped<
+    typename cutlass::gemm::kernel::DefaultGemmGrouped<
+        _GG_ElA, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 8,
+        _GG_ElB, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 8,
+        _GG_ElC, cutlass::layout::RowMajor,
+        _GG_ElAcc,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 256, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<_GG_ElC, 8, _GG_ElAcc, _GG_ElAcc>,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+        4>::GemmKernel>;
+
+struct GroupedGemmCtx {
+    // Device-side scratch (max_problems-sized; refilled per call).
+    cutlass::gemm::GemmCoord* d_problem_sizes = nullptr;
+    _GG_ElA** d_ptrA = nullptr;
+    _GG_ElB** d_ptrB = nullptr;
+    _GG_ElC** d_ptrC = nullptr;
+    int64_t* d_lda = nullptr;
+    int64_t* d_ldb = nullptr;
+    int64_t* d_ldc = nullptr;
+    uint8_t* d_workspace = nullptr;
+    std::size_t workspace_bytes = 0;
+
+    // Host scratch (rebuilt per FFN stage; size <= max_problems).
+    std::vector<cutlass::gemm::GemmCoord> h_problem_sizes;
+    std::vector<_GG_ElA*> h_ptrA;
+    std::vector<_GG_ElB*> h_ptrB;
+    std::vector<_GG_ElC*> h_ptrC;
+    std::vector<int64_t> h_lda, h_ldb, h_ldc;
+
+    int max_problems = 0;
+    int sm_count     = 108;  // A100 default; refresh from cudaGetDeviceProperties
+};
+
+static void gg_init(GroupedGemmCtx& ctx, int max_problems) {
+    ctx.max_problems = max_problems;
+    cudaDeviceProp prop;
+    int dev = 0;
+    MOE_CUDA_CHECK(cudaGetDevice(&dev));
+    MOE_CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+    ctx.sm_count = prop.multiProcessorCount;
+
+    MOE_CUDA_CHECK(cudaMalloc(&ctx.d_problem_sizes,
+        max_problems * sizeof(cutlass::gemm::GemmCoord)));
+    MOE_CUDA_CHECK(cudaMalloc(&ctx.d_ptrA, max_problems * sizeof(_GG_ElA*)));
+    MOE_CUDA_CHECK(cudaMalloc(&ctx.d_ptrB, max_problems * sizeof(_GG_ElB*)));
+    MOE_CUDA_CHECK(cudaMalloc(&ctx.d_ptrC, max_problems * sizeof(_GG_ElC*)));
+    MOE_CUDA_CHECK(cudaMalloc(&ctx.d_lda, max_problems * sizeof(int64_t)));
+    MOE_CUDA_CHECK(cudaMalloc(&ctx.d_ldb, max_problems * sizeof(int64_t)));
+    MOE_CUDA_CHECK(cudaMalloc(&ctx.d_ldc, max_problems * sizeof(int64_t)));
+
+    ctx.h_problem_sizes.reserve(max_problems);
+    ctx.h_ptrA.reserve(max_problems);
+    ctx.h_ptrB.reserve(max_problems);
+    ctx.h_ptrC.reserve(max_problems);
+    ctx.h_lda.reserve(max_problems);
+    ctx.h_ldb.reserve(max_problems);
+    ctx.h_ldc.reserve(max_problems);
+
+    // Workspace: estimate from max-shape problem; reuse across calls.
+    // We over-allocate via initialize() with a max-size dummy below.
+    ctx.workspace_bytes = 0;
+    ctx.d_workspace = nullptr;
+}
+
+static void gg_destroy(GroupedGemmCtx& ctx) {
+    cudaFree(ctx.d_problem_sizes);
+    cudaFree(ctx.d_ptrA); cudaFree(ctx.d_ptrB); cudaFree(ctx.d_ptrC);
+    cudaFree(ctx.d_lda);  cudaFree(ctx.d_ldb);  cudaFree(ctx.d_ldc);
+    if (ctx.d_workspace) cudaFree(ctx.d_workspace);
+}
+
+// Issue one grouped-GEMM call onto `stream`. Caller has already populated
+// ctx.h_problem_sizes / h_ptrA/B/C / h_lda/b/c.
+static void gg_run(GroupedGemmCtx& ctx, cudaStream_t stream) {
+    int n = (int)ctx.h_problem_sizes.size();
+    if (n == 0) return;
+
+    MOE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_problem_sizes, ctx.h_problem_sizes.data(),
+        n * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyHostToDevice, stream));
+    MOE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_ptrA, ctx.h_ptrA.data(),
+        n * sizeof(_GG_ElA*), cudaMemcpyHostToDevice, stream));
+    MOE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_ptrB, ctx.h_ptrB.data(),
+        n * sizeof(_GG_ElB*), cudaMemcpyHostToDevice, stream));
+    MOE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_ptrC, ctx.h_ptrC.data(),
+        n * sizeof(_GG_ElC*), cudaMemcpyHostToDevice, stream));
+    MOE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_lda, ctx.h_lda.data(),
+        n * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    MOE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_ldb, ctx.h_ldb.data(),
+        n * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    MOE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_ldc, ctx.h_ldc.data(),
+        n * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+
+    int tb_count = GroupedGemm_t::sufficient(ctx.h_problem_sizes.data(), n);
+    if (tb_count == 0) tb_count = ctx.sm_count;
+
+    typename GroupedGemm_t::EpilogueOutputOp::Params epilogue(
+        _GG_ElAcc(1.0f), _GG_ElAcc(0.0f));
+    typename GroupedGemm_t::Arguments args(
+        ctx.d_problem_sizes, n, tb_count, epilogue,
+        ctx.d_ptrA, ctx.d_ptrB, ctx.d_ptrC, ctx.d_ptrC,
+        ctx.d_lda,  ctx.d_ldb,  ctx.d_ldc, ctx.d_ldc,
+        ctx.h_problem_sizes.data());
+
+    GroupedGemm_t gemm;
+    std::size_t ws = gemm.get_workspace_size(args);
+    if (ws > ctx.workspace_bytes) {
+        if (ctx.d_workspace) cudaFree(ctx.d_workspace);
+        MOE_CUDA_CHECK(cudaMalloc(&ctx.d_workspace, ws));
+        ctx.workspace_bytes = ws;
+    }
+    auto st = gemm.initialize(args, ctx.d_workspace, stream);
+    if (st != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "GroupedGemm initialize failed: %d\n", (int)st);
+        std::exit(1);
+    }
+    auto rs = gemm.run(stream);
+    if (rs != cutlass::Status::kSuccess) {
+        std::fprintf(stderr, "GroupedGemm run failed: %d\n", (int)rs);
+        std::exit(1);
+    }
+}
 
 // ── Barrier for N threads ─────────────────────────────────────────────────────
 
@@ -115,6 +254,7 @@ struct Config {
     int         repeats   = 9;   // odd, larger N → stabler median against cloud noise
     int         overlap   = 0;   // 0 = single-stream serial, 1 = 2-stream comm/compute overlap
     int         chunks    = 1;   // when overlap=1: 1 = unchunked, K>1 = K-chunk dispatch (1F1B-style)
+    std::string ffn       = "cublas";  // cublas (per-expert hgemm loop) | grouped (CUTLASS GroupedGemm)
 };
 
 Config parse(int argc, char** argv) {
@@ -136,6 +276,7 @@ Config parse(int argc, char** argv) {
         else if (k == "repeats")  c.repeats  = std::atoi(v.c_str());
         else if (k == "overlap")  c.overlap  = std::atoi(v.c_str());
         else if (k == "chunks")   c.chunks   = std::atoi(v.c_str());
+        else if (k == "ffn")      c.ffn      = v;
         else { std::fprintf(stderr, "unknown flag --%s\n", k.c_str()); std::exit(1); }
     }
     if (c.prefix.empty()) {
@@ -318,6 +459,15 @@ void rank_worker(
 
     __half alpha_h = __float2half(1.f), beta_h = __float2half(0.f);
 
+    // Grouped-GEMM context (only used when --ffn=grouped). Max problems per
+    // call = n_ranks * experts_per_gpu (one (sender, local_expert) pair).
+    const bool use_grouped_ffn = (cfg.ffn == "grouped");
+    GroupedGemmCtx ggW1, ggW2;
+    if (use_grouped_ffn) {
+        gg_init(ggW1, n_ranks * experts_per_gpu);
+        gg_init(ggW2, n_ranks * experts_per_gpu);
+    }
+
     // Host-side scratch (reused across rounds)
     std::vector<int32_t> h_all_counts((std::size_t)n_ranks * p.E);
     std::vector<int32_t> h_send_off_tok(n_ranks + 1);  // token offsets in bufs.packed
@@ -457,32 +607,88 @@ void rank_worker(
                 // Walk d_dispatch_recv following the same per-(sender, expert)
                 // order it was written. Skip the (sender, expert) pairs whose
                 // expert is not in this chunk's range.
-                std::size_t curr_tok = 0;
-                for (int g = 0; g < n_ranks; ++g) {
-                    for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
-                        int e_global = rank * experts_per_gpu + e_local;
-                        int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
-                        if (cnt == 0) continue;
-                        if (e_local < e_local_lo || e_local >= e_local_hi) {
-                            curr_tok += cnt;  // skip — not in this chunk
-                            continue;
+                if (use_grouped_ffn) {
+                    // Build per-(sender, local_expert) problem list for THIS
+                    // chunk, then issue a single GroupedGemm for W1 and a
+                    // single GroupedGemm for W2.
+                    ggW1.h_problem_sizes.clear(); ggW1.h_ptrA.clear();
+                    ggW1.h_ptrB.clear(); ggW1.h_ptrC.clear();
+                    ggW1.h_lda.clear(); ggW1.h_ldb.clear(); ggW1.h_ldc.clear();
+                    ggW2.h_problem_sizes.clear(); ggW2.h_ptrA.clear();
+                    ggW2.h_ptrB.clear(); ggW2.h_ptrC.clear();
+                    ggW2.h_lda.clear(); ggW2.h_ldb.clear(); ggW2.h_ldc.clear();
+
+                    std::size_t curr_tok = 0;
+                    for (int g = 0; g < n_ranks; ++g) {
+                        for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
+                            int e_global = rank * experts_per_gpu + e_local;
+                            int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
+                            if (cnt == 0) continue;
+                            if (e_local < e_local_lo || e_local >= e_local_hi) {
+                                curr_tok += cnt; continue;
+                            }
+                            __half* A   = d_dispatch_recv + curr_tok * d_model;
+                            __half* B1  = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
+                            __half* B2  = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
+                            __half* mid = d_ffn_tmp    + curr_tok * p.d_ffn;
+                            __half* eout= d_expert_out + curr_tok * d_model;
+
+                            // W1: (cnt, d_ffn, d_model) M×N×K, RowMajor
+                            //   A = d_dispatch_recv slice [cnt, d_model], lda=d_model
+                            //   B = W1[e]              [d_model, d_ffn], ldb=d_ffn
+                            //   C = mid                [cnt, d_ffn],     ldc=d_ffn
+                            ggW1.h_problem_sizes.emplace_back(cnt, p.d_ffn, d_model);
+                            ggW1.h_ptrA.push_back(reinterpret_cast<_GG_ElA*>(A));
+                            ggW1.h_ptrB.push_back(reinterpret_cast<_GG_ElB*>(B1));
+                            ggW1.h_ptrC.push_back(reinterpret_cast<_GG_ElC*>(mid));
+                            ggW1.h_lda.push_back(d_model);
+                            ggW1.h_ldb.push_back(p.d_ffn);
+                            ggW1.h_ldc.push_back(p.d_ffn);
+
+                            // W2: (cnt, d_model, d_ffn) M×N×K, RowMajor
+                            //   A = mid              [cnt, d_ffn],   lda=d_ffn
+                            //   B = W2[e]            [d_ffn, d_model], ldb=d_model
+                            //   C = eout             [cnt, d_model], ldc=d_model
+                            ggW2.h_problem_sizes.emplace_back(cnt, d_model, p.d_ffn);
+                            ggW2.h_ptrA.push_back(reinterpret_cast<_GG_ElA*>(mid));
+                            ggW2.h_ptrB.push_back(reinterpret_cast<_GG_ElB*>(B2));
+                            ggW2.h_ptrC.push_back(reinterpret_cast<_GG_ElC*>(eout));
+                            ggW2.h_lda.push_back(p.d_ffn);
+                            ggW2.h_ldb.push_back(d_model);
+                            ggW2.h_ldc.push_back(d_model);
+
+                            curr_tok += cnt;
                         }
-                        const __half* A  = d_dispatch_recv + curr_tok * d_model;
-                        const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
-                        const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
-                        __half* mid      = d_ffn_tmp    + curr_tok * p.d_ffn;
-                        __half* eout     = d_expert_out + curr_tok * d_model;
+                    }
+                    gg_run(ggW1, s_cmp);
+                    gg_run(ggW2, s_cmp);
+                } else {
+                    std::size_t curr_tok = 0;
+                    for (int g = 0; g < n_ranks; ++g) {
+                        for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
+                            int e_global = rank * experts_per_gpu + e_local;
+                            int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
+                            if (cnt == 0) continue;
+                            if (e_local < e_local_lo || e_local >= e_local_hi) {
+                                curr_tok += cnt; continue;
+                            }
+                            const __half* A  = d_dispatch_recv + curr_tok * d_model;
+                            const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
+                            const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
+                            __half* mid      = d_ffn_tmp    + curr_tok * p.d_ffn;
+                            __half* eout     = d_expert_out + curr_tok * d_model;
 
-                        CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                            p.d_ffn, cnt, d_model, &alpha_h,
-                            B1, p.d_ffn, A, d_model,
-                            &beta_h, mid, p.d_ffn));
-                        CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                            d_model, cnt, p.d_ffn, &alpha_h,
-                            B2, d_model, mid, p.d_ffn,
-                            &beta_h, eout, d_model));
+                            CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                                p.d_ffn, cnt, d_model, &alpha_h,
+                                B1, p.d_ffn, A, d_model,
+                                &beta_h, mid, p.d_ffn));
+                            CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                                d_model, cnt, p.d_ffn, &alpha_h,
+                                B2, d_model, mid, p.d_ffn,
+                                &beta_h, eout, d_model));
 
-                        curr_tok += cnt;
+                            curr_tok += cnt;
+                        }
                     }
                 }
                 MOE_CUDA_CHECK(cudaEventRecord(ev_ffn_done[c], s_cmp));
@@ -575,29 +781,72 @@ void rank_worker(
         rr->dispatch_ms = td.stop_ms(s_cmp);
 
         tf.start(s_cmp);
-        std::size_t curr_tok = 0;
-        for (int g = 0; g < n_ranks; ++g) {
-            for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
-                int e_global = rank * experts_per_gpu + e_local;
-                int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
-                if (cnt == 0) continue;
+        if (use_grouped_ffn) {
+            ggW1.h_problem_sizes.clear(); ggW1.h_ptrA.clear();
+            ggW1.h_ptrB.clear(); ggW1.h_ptrC.clear();
+            ggW1.h_lda.clear(); ggW1.h_ldb.clear(); ggW1.h_ldc.clear();
+            ggW2.h_problem_sizes.clear(); ggW2.h_ptrA.clear();
+            ggW2.h_ptrB.clear(); ggW2.h_ptrC.clear();
+            ggW2.h_lda.clear(); ggW2.h_ldb.clear(); ggW2.h_ldc.clear();
 
-                const __half* A  = d_dispatch_recv + curr_tok * d_model;
-                const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
-                const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
-                __half* mid      = d_ffn_tmp    + curr_tok * p.d_ffn;
-                __half* eout     = d_expert_out + curr_tok * d_model;
+            std::size_t curr_tok = 0;
+            for (int g = 0; g < n_ranks; ++g) {
+                for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
+                    int e_global = rank * experts_per_gpu + e_local;
+                    int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
+                    if (cnt == 0) continue;
+                    __half* A   = d_dispatch_recv + curr_tok * d_model;
+                    __half* B1  = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
+                    __half* B2  = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
+                    __half* mid = d_ffn_tmp    + curr_tok * p.d_ffn;
+                    __half* eout= d_expert_out + curr_tok * d_model;
 
-                CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    p.d_ffn, cnt, d_model, &alpha_h,
-                    B1, p.d_ffn, A, d_model,
-                    &beta_h, mid, p.d_ffn));
-                CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    d_model, cnt, p.d_ffn, &alpha_h,
-                    B2, d_model, mid, p.d_ffn,
-                    &beta_h, eout, d_model));
+                    ggW1.h_problem_sizes.emplace_back(cnt, p.d_ffn, d_model);
+                    ggW1.h_ptrA.push_back(reinterpret_cast<_GG_ElA*>(A));
+                    ggW1.h_ptrB.push_back(reinterpret_cast<_GG_ElB*>(B1));
+                    ggW1.h_ptrC.push_back(reinterpret_cast<_GG_ElC*>(mid));
+                    ggW1.h_lda.push_back(d_model);
+                    ggW1.h_ldb.push_back(p.d_ffn);
+                    ggW1.h_ldc.push_back(p.d_ffn);
 
-                curr_tok += cnt;
+                    ggW2.h_problem_sizes.emplace_back(cnt, d_model, p.d_ffn);
+                    ggW2.h_ptrA.push_back(reinterpret_cast<_GG_ElA*>(mid));
+                    ggW2.h_ptrB.push_back(reinterpret_cast<_GG_ElB*>(B2));
+                    ggW2.h_ptrC.push_back(reinterpret_cast<_GG_ElC*>(eout));
+                    ggW2.h_lda.push_back(p.d_ffn);
+                    ggW2.h_ldb.push_back(d_model);
+                    ggW2.h_ldc.push_back(d_model);
+
+                    curr_tok += cnt;
+                }
+            }
+            gg_run(ggW1, s_cmp);
+            gg_run(ggW2, s_cmp);
+        } else {
+            std::size_t curr_tok = 0;
+            for (int g = 0; g < n_ranks; ++g) {
+                for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
+                    int e_global = rank * experts_per_gpu + e_local;
+                    int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
+                    if (cnt == 0) continue;
+
+                    const __half* A  = d_dispatch_recv + curr_tok * d_model;
+                    const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
+                    const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
+                    __half* mid      = d_ffn_tmp    + curr_tok * p.d_ffn;
+                    __half* eout     = d_expert_out + curr_tok * d_model;
+
+                    CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        p.d_ffn, cnt, d_model, &alpha_h,
+                        B1, p.d_ffn, A, d_model,
+                        &beta_h, mid, p.d_ffn));
+                    CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        d_model, cnt, p.d_ffn, &alpha_h,
+                        B2, d_model, mid, p.d_ffn,
+                        &beta_h, eout, d_model));
+
+                    curr_tok += cnt;
+                }
             }
         }
         rr->ffn_ms = tf.stop_ms(s_cmp);
@@ -703,6 +952,10 @@ void rank_worker(
         cudaEventDestroy(ev_dispatch_done[c]);
         cudaEventDestroy(ev_ffn_done[c]);
     }
+    if (use_grouped_ffn) {
+        gg_destroy(ggW1);
+        gg_destroy(ggW2);
+    }
     cudaStreamDestroy(s_cmp);
     if (cfg.overlap) cudaStreamDestroy(s_com);
 }
@@ -726,8 +979,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("\n== bench_prefill  strategy=%s  prefix=%s  n_gpus=%d  overlap=%d  chunks=%d ==\n\n",
-                cfg.strategy.c_str(), cfg.prefix.c_str(), n_ranks, cfg.overlap, cfg.chunks);
+    std::printf("\n== bench_prefill  strategy=%s  prefix=%s  n_gpus=%d  overlap=%d  chunks=%d  ffn=%s ==\n\n",
+                cfg.strategy.c_str(), cfg.prefix.c_str(), n_ranks, cfg.overlap,
+                cfg.chunks, cfg.ffn.c_str());
 
     // ── NCCL init ─────────────────────────────────────────────────────────────
     std::vector<ncclComm_t> comms(n_ranks);
