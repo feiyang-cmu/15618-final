@@ -302,6 +302,30 @@ def _run_profile(strategy: str):
     return output
 
 
+def _run_blocksparse(strategy: str):
+    """Block-sparse / Megablocks-style microbench: pre-packed cuBLAS vs
+    fused gather+W1 kernel that skips materializing bufs.packed.
+
+    Tests prefill T=2048 and decode T=16/64/256 shapes. The fused kernel
+    here is naive (no tensor cores) — it proves correctness and quantifies
+    the memory-pass saving; production would use CUTLASS for tensor-core
+    throughput.
+    """
+    output = _gpu_info(1)
+    ok, msg = _build()
+    output += msg
+    if not ok:
+        return output
+
+    for dist in ("uniform", "zipf"):
+        for T in (16, 64, 256, 2048):
+            output += _run_cmd(
+                ["./build/bin/bench_blocksparse", dist, str(T)],
+                f"blocksparse T={T} {dist}",
+            )
+    return output
+
+
 # ── Per-GPU-count functions ───────────────────────────────────────────────────
 
 @app.function(image=image, gpu="A100", timeout=900)
@@ -310,6 +334,8 @@ def bench_1gpu(strategy: str = "all", mode: str = "ep"):
         return _run_prefill(1, strategy)
     if mode == "profile":
         return _run_profile(strategy)
+    if mode == "blocksparse":
+        return _run_blocksparse(strategy)
     return _run_ep(1, strategy)
 
 
