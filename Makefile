@@ -26,7 +26,8 @@ NCCL      ?= $(HOME)/.local/lib/python3.6/site-packages/nvidia/nccl
 INCLUDES  := -Iinclude -I$(CUBLAS12)/include
 CUTLASS_INC := -I$(CUTLASS)/include -I$(CUTLASS)/tools/util/include
 NCCL_INC  := -I$(NCCL)/include
-NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) --expt-relaxed-constexpr $(INCLUDES)
+NVCC_FLAGS_EXTRA ?=
+NVCCFLAGS := -O3 -std=c++17 -arch=$(ARCH) --expt-relaxed-constexpr $(INCLUDES) $(NVCC_FLAGS_EXTRA)
 
 # cuBLAS 12 from conda (driver 572.83 is incompatible with CUDA 11.6 cuBLAS).
 CUBLAS_LINK := -Xlinker -rpath=$(CUBLAS12)/lib \

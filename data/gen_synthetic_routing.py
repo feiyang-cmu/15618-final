@@ -274,6 +274,17 @@ SWEEP_SIZES = {
     "xxlarge":16384,   # stress test / future scaling
 }
 
+# Decode-shaped batch sizes: T = small batch of tokens, one decode step.
+# At small T the comm/compute ratio flips relative to prefill, so EP
+# overhead grows from ~10 % (prefill) to >50 % (decode).
+DECODE_SIZES = {
+    "decode16":  16,
+    "decode32":  32,
+    "decode64":  64,
+    "decode128": 128,
+    "decode256": 256,
+}
+
 
 if __name__ == "__main__":
     # usage: python data/gen_synthetic_routing.py --tokens 2048 --experts 64 --topk 4 --dim 2048
@@ -291,6 +302,8 @@ if __name__ == "__main__":
                         help="Which distribution(s) to generate")
     parser.add_argument("--sweep",   action="store_true",
                         help="Generate small/medium/large sizes (ignores --tokens)")
+    parser.add_argument("--decode-sweep", action="store_true",
+                        help="Generate decode-shaped sizes T={16,32,64,128,256}")
     parser.add_argument("--rounds",  type=int,   default=0,
                         help="Generate multi-round data with N rounds (0 = single-round only)")
     parser.add_argument("--out",     type=str,   default="results",
@@ -302,6 +315,8 @@ if __name__ == "__main__":
     # Build list of (T, label) pairs to generate
     if args.sweep:
         runs = [(t, label) for label, t in SWEEP_SIZES.items()]
+    elif args.decode_sweep:
+        runs = [(t, label) for label, t in DECODE_SIZES.items()]
     else:
         runs = [(args.tokens, None)]
 

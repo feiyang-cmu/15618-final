@@ -32,6 +32,7 @@ _base_image = (
         "nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12"
     )
     .apt_install("git", "cuda-nsight-compute-12-4", "cuda-nsight-systems-12-4")
+    .pip_install("numpy")  # for on-demand decode-shape data generation
     .run_commands(
         "apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev"
     )
@@ -188,19 +189,22 @@ def _run_prefill(n_gpus: int, strategy: str):
         # d-element copy loop) — what a from-scratch implementation looks like.
         # All speedups in the report are claimed against this baseline.
         chain = [
-            ("atomic", 0, "naive baseline (atomic + serial)"),
-            ("warp",   0, "+ warp gather (radix sort + warp-per-row)"),
-            ("vec",    0, "+ uint4 (vectorized gather)"),
-            ("csort",  0, "+ csort (counting sort, replace radix + bounds)"),
-            ("csort",  1, "+ overlap (2-stream comm/compute)"),
+            ("atomic", 0, 1, "naive baseline (atomic + serial)"),
+            ("warp",   0, 1, "+ warp gather (radix sort + warp-per-row)"),
+            ("vec",    0, 1, "+ uint4 (vectorized gather)"),
+            ("csort",  0, 1, "+ csort (counting sort, replace radix + bounds)"),
+            ("csort",  1, 1, "+ overlap (2-stream comm/compute)"),
+            ("csort",  1, 2, "+ chunked dispatch K=2 (1F1B intra-round)"),
+            ("csort",  1, 4, "+ chunked dispatch K=4"),
         ]
         for dist in ["uniform", "zipf"]:
             prefix = f"syn_{dist}_T{T}_N32"
-            for s, ov, label in chain:
+            for s, ov, ch, label in chain:
                 output += _run_cmd(
                     ["./build/bin/bench_prefill",
                      f"--prefix={prefix}", f"--strategy={s}",
-                     f"--n-gpus={n_gpus}", f"--overlap={ov}"],
+                     f"--n-gpus={n_gpus}", f"--overlap={ov}",
+                     f"--chunks={ch}"],
                     f"prefill {dist}  {label}",
                 )
         return output
@@ -270,6 +274,98 @@ def _run_real(n_gpus: int, strategy: str):
     return output
 
 
+def _run_decode(n_gpus: int, strategy: str):
+    """Decode-shaped sweep: T ∈ {16, 32, 64, 128, 256} per round.
+
+    At small T, comm/compute ratio flips relative to prefill — EP overhead
+    grows from ~10% (prefill T=2048) to >50% (decode T=16). Our overlap
+    optimization should show much larger relative wins in this regime.
+
+    For each T, runs serial vs csort+overlap and reports the speedup.
+    Skips T values where T % n_gpus != 0 (split-input requires T_local ≥ 1).
+    """
+    import subprocess
+
+    output = _gpu_info(n_gpus)
+
+    # Generate decode-shaped routing data inside the container (numpy is in
+    # the base image now). Multi-round (N_rounds=32) so the bench loops.
+    output += "Generating decode-shaped routing data...\n"
+    r = subprocess.run(
+        ["python", "data/gen_synthetic_routing.py",
+         "--decode-sweep", "--rounds", "32"],
+        cwd="/workspace", capture_output=True, text=True, timeout=300,
+    )
+    if r.returncode != 0:
+        output += f"data gen FAILED:\n{r.stdout}\n{r.stderr}\n"
+        return output
+    output += "data gen OK\n\n"
+
+    ok, msg = _build()
+    output += msg
+    if not ok:
+        return output
+
+    # Sweep T sizes that divide n_gpus evenly. Compare serial vs csort+overlap
+    # at each T to highlight that overlap matters more as T shrinks.
+    decode_T = [16, 32, 64, 128, 256]
+    s = strategy if strategy != "all" else "csort"
+    for dist in ("uniform", "zipf"):
+        for T in decode_T:
+            if T % n_gpus != 0:
+                continue
+            prefix = f"syn_{dist}_T{T}_N32"
+            for ov in (0, 1):
+                tag = "overlap" if ov else "serial"
+                output += _run_cmd(
+                    ["./build/bin/bench_prefill",
+                     f"--prefix={prefix}", f"--strategy={s}",
+                     f"--n-gpus={n_gpus}", f"--overlap={ov}"],
+                    f"decode T={T} {dist} {tag}",
+                )
+    return output
+
+
+def _run_grouped_gemm(strategy: str):
+    """Re-test CUTLASS grouped GEMM vs sequential cuBLAS on A100.
+
+    The original negative result was on RTX 4070 Super (56 SMs, 78 TFLOPS).
+    A100 has 108 SMs and 312 TFLOPS — single per-expert GEMM (M=128) may
+    leave SMs idle, which grouped GEMM can fill.
+    """
+    import subprocess
+    output = _gpu_info(1)
+    ok, msg = _build()
+    output += msg
+    if not ok:
+        return output
+
+    tile_sweep = [
+        (64,  64,  32, 32, 32),
+        (64,  128, 32, 32, 64),
+        (128, 64,  32, 64, 32),
+        (128, 128, 32, 64, 64),
+        (256, 128, 32, 64, 64),
+        (128, 256, 32, 64, 64),
+    ]
+    for tm, tn, tk, wm, wn in tile_sweep:
+        defs = (f"-DTILE_M={tm} -DTILE_N={tn} -DTILE_K={tk} "
+                f"-DWARP_M={wm} -DWARP_N={wn}")
+        output += _run_cmd(
+            ["bash", "-lc",
+             "rm -f build/obj/grouped_gemm_test.o build/bin/grouped_gemm_test && "
+             f"NVCC_FLAGS_EXTRA='{defs}' make build/bin/grouped_gemm_test "
+             "ARCH=sm_80 CUBLAS12=/usr/local/cuda CUTLASS=/opt/cutlass NCCL=/opt/nccl"],
+            f"build tile {tm}x{tn}x{tk}",
+        )
+        for dist in ("uniform", "zipf"):
+            output += _run_cmd(
+                ["./build/bin/grouped_gemm_test", dist],
+                f"tile {tm}x{tn}x{tk}/{wm}x{wn} {dist}",
+            )
+    return output
+
+
 def _run_profile(strategy: str):
     """Per-stage breakdown via bench_scatter's built-in ScatterTimings.
 
@@ -310,6 +406,10 @@ def bench_1gpu(strategy: str = "all", mode: str = "ep"):
         return _run_prefill(1, strategy)
     if mode == "profile":
         return _run_profile(strategy)
+    if mode == "grouped_gemm":
+        return _run_grouped_gemm(strategy)
+    if mode == "decode":
+        return _run_decode(1, strategy)
     return _run_ep(1, strategy)
 
 
@@ -317,6 +417,8 @@ def bench_1gpu(strategy: str = "all", mode: str = "ep"):
 def bench_2gpu(strategy: str = "all", mode: str = "ep"):
     if mode == "prefill":
         return _run_prefill(2, strategy)
+    if mode == "decode":
+        return _run_decode(2, strategy)
     return _run_ep(2, strategy)
 
 
@@ -324,6 +426,8 @@ def bench_2gpu(strategy: str = "all", mode: str = "ep"):
 def bench_4gpu(strategy: str = "all", mode: str = "ep"):
     if mode == "prefill":
         return _run_prefill(4, strategy)
+    if mode == "decode":
+        return _run_decode(4, strategy)
     return _run_ep(4, strategy)
 
 
@@ -331,6 +435,8 @@ def bench_4gpu(strategy: str = "all", mode: str = "ep"):
 def bench_8gpu(strategy: str = "all", mode: str = "ep"):
     if mode == "prefill":
         return _run_prefill(8, strategy)
+    if mode == "decode":
+        return _run_decode(8, strategy)
     return _run_ep(8, strategy)
 
 
