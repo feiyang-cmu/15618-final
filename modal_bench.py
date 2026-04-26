@@ -163,9 +163,16 @@ def _run_ep(n_gpus: int, strategy: str):
 def _run_prefill(n_gpus: int, strategy: str):
     """Multi-round prefill benchmark (bench_prefill).
 
-    Runs each (dist, strategy) twice: once serial (--overlap=0) and once
-    with comm/compute overlap (--overlap=1) so we can A/B compare wall
-    time and confirm the L2 checksum still matches.
+    Default behaviour (`--strategy=all`) sweeps the additive optimization
+    chain so we get a single table showing cumulative improvement:
+
+        baseline   = warp  + serial
+        +vec       = vec   + serial
+        +csort     = csort + serial
+        +overlap   = csort + overlap  (csort wins from prior pass + 2-stream)
+
+    A specific --strategy=foo runs only that strategy in both serial and
+    overlap modes for direct A/B comparison.
     """
     output = _gpu_info(n_gpus)
     ok, msg = _build()
@@ -173,20 +180,38 @@ def _run_prefill(n_gpus: int, strategy: str):
     if not ok:
         return output
 
-    strategies = [strategy] if strategy != "all" else STRATEGIES
     T = GPU_TO_T.get(n_gpus, 2048)
 
-    for dist in ["uniform", "zipf"]:
-        prefix = f"syn_{dist}_T{T}_N32"
-        for s in strategies:
-            for ov in (0, 1):
-                tag = "overlap" if ov else "serial"
+    if strategy == "all":
+        # Cumulative chain: each row adds one optimization on the previous.
+        chain = [
+            ("warp",  0, "baseline (warp + serial)"),
+            ("vec",   0, "+ vec (uint4 gather)"),
+            ("csort", 0, "+ csort (counting sort)"),
+            ("csort", 1, "+ overlap (2-stream)"),
+        ]
+        for dist in ["uniform", "zipf"]:
+            prefix = f"syn_{dist}_T{T}_N32"
+            for s, ov, label in chain:
                 output += _run_cmd(
                     ["./build/bin/bench_prefill",
                      f"--prefix={prefix}", f"--strategy={s}",
                      f"--n-gpus={n_gpus}", f"--overlap={ov}"],
-                    f"bench_prefill {prefix} {s} ({n_gpus} GPUs, {tag})",
+                    f"prefill {dist}  {label}",
                 )
+        return output
+
+    # Single strategy A/B (serial vs overlap)
+    for dist in ["uniform", "zipf"]:
+        prefix = f"syn_{dist}_T{T}_N32"
+        for ov in (0, 1):
+            tag = "overlap" if ov else "serial"
+            output += _run_cmd(
+                ["./build/bin/bench_prefill",
+                 f"--prefix={prefix}", f"--strategy={strategy}",
+                 f"--n-gpus={n_gpus}", f"--overlap={ov}"],
+                f"bench_prefill {prefix} {strategy} ({n_gpus} GPUs, {tag})",
+            )
 
     return output
 
