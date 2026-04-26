@@ -184,11 +184,15 @@ def _run_prefill(n_gpus: int, strategy: str):
 
     if strategy == "all":
         # Cumulative chain: each row adds one optimization on the previous.
+        # `atomic` is the true naive baseline (per-thread atomic + per-thread
+        # d-element copy loop) — what a from-scratch implementation looks like.
+        # All speedups in the report are claimed against this baseline.
         chain = [
-            ("warp",  0, "baseline (warp + serial)"),
-            ("vec",   0, "+ vec (uint4 gather)"),
-            ("csort", 0, "+ csort (counting sort)"),
-            ("csort", 1, "+ overlap (2-stream)"),
+            ("atomic", 0, "naive baseline (atomic + serial)"),
+            ("warp",   0, "+ warp gather (radix sort + warp-per-row)"),
+            ("vec",    0, "+ uint4 (vectorized gather)"),
+            ("csort",  0, "+ csort (counting sort, replace radix + bounds)"),
+            ("csort",  1, "+ overlap (2-stream comm/compute)"),
         ]
         for dist in ["uniform", "zipf"]:
             prefix = f"syn_{dist}_T{T}_N32"
