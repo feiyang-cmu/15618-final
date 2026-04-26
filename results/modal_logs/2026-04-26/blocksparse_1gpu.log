@@ -1,0 +1,160 @@
+✓ Initialized. View run at 
+https://modal.com/apps/feiyang2/main/ap-LHUJH90vYOzuFYQhB8c9FT
+✓ Created objects.
+├── 🔨 Created mount /tmp/modal_bench_nomounts.py
+├── 🔨 Created mount /home/steven/project/15618-final
+├── 🔨 Created function bench_real_1gpu.
+├── 🔨 Created function bench_real_2gpu.
+├── 🔨 Created function bench_1gpu.
+├── 🔨 Created function bench_2gpu.
+├── 🔨 Created function bench_4gpu.
+└── 🔨 Created function bench_8gpu.
+Launching blocksparse on 1x A100 (strategy=all) ...
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.4.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[gpu-health] [WARN] GPU-007e76f0-efa0-b66f-36ac-d970a335f706: XID: NVRM: Xid (PCI:0000:00:09): 31, pid=3211958, name=exe, channel 0x0000000a, intr 00000000. MMU Fault: ENGINE GRAPHICS GPC6 GPCCLIENT_T1_5 faulted @ 0x2be7_02002000. Fault is of type FAULT_PDE ACCESS_TYPE_VIRT_READ
+
+GPUs (1 requested):
+0, NVIDIA A100-SXM4-40GB, 40960 MiB
+
+Build OK
+
+=== blocksparse T=16 uniform ===
+
+== bench_blocksparse  dist=uniform  T=16  K=4  E=64  d=2048  d_ffn=8192 ==
+
+   expert load: min=0 max=4 mean=1.0 imbalance=4.00x
+
+   correctness   max|ref - blocksparse| = 9.9182e-05  (sample=64 rows)
+
+   variant            time (ms)   throughput (TFLOPS)   ratio vs packed
+   packed cuBLAS         1.195           1.80               1.000x
+   blocksparse naive     1.690           1.27               0.707x
+
+   memory: packed buffer materialization saved by blocksparse:
+      0.25 MB write + 0.25 MB read = 0.50 MB / iteration
+
+
+=== blocksparse T=64 uniform ===
+
+== bench_blocksparse  dist=uniform  T=64  K=4  E=64  d=2048  d_ffn=8192 ==
+
+   expert load: min=1 max=8 mean=4.0 imbalance=2.00x
+
+   correctness   max|ref - blocksparse| = 9.1553e-05  (sample=64 rows)
+
+   variant            time (ms)   throughput (TFLOPS)   ratio vs packed
+   packed cuBLAS         1.958           4.39               1.000x
+   blocksparse naive     4.620           1.86               0.424x
+
+   memory: packed buffer materialization saved by blocksparse:
+      1.00 MB write + 1.00 MB read = 2.00 MB / iteration
+
+
+=== blocksparse T=256 uniform ===
+
+== bench_blocksparse  dist=uniform  T=256  K=4  E=64  d=2048  d_ffn=8192 ==
+
+   expert load: min=8 max=25 mean=16.0 imbalance=1.56x
+
+   correctness   max|ref - blocksparse| = 9.1553e-05  (sample=64 rows)
+
+   variant            time (ms)   throughput (TFLOPS)   ratio vs packed
+   packed cuBLAS         2.007          17.12               1.000x
+   blocksparse naive    14.459           2.38               0.139x
+
+   memory: packed buffer materialization saved by blocksparse:
+      4.00 MB write + 4.00 MB read = 8.00 MB / iteration
+
+
+=== blocksparse T=2048 uniform ===
+
+== bench_blocksparse  dist=uniform  T=2048  K=4  E=64  d=2048  d_ffn=8192 ==
+
+   expert load: min=101 max=151 mean=128.0 imbalance=1.18x
+
+STDERR: CUDA apps/bench_blocksparse.cu:255: an illegal memory access was encountered
+
+[exit code 1]
+
+=== blocksparse T=16 zipf ===
+
+== bench_blocksparse  dist=zipf  T=16  K=4  E=64  d=2048  d_ffn=8192 ==
+
+   expert load: min=0 max=11 mean=1.0 imbalance=11.00x
+
+   correctness   max|ref - blocksparse| = 9.9182e-05  (sample=64 rows)
+
+   variant            time (ms)   throughput (TFLOPS)   ratio vs packed
+   packed cuBLAS         0.985           2.18               1.000x
+   blocksparse naive     1.620           1.33               0.608x
+
+   memory: packed buffer materialization saved by blocksparse:
+      0.25 MB write + 0.25 MB read = 0.50 MB / iteration
+
+
+=== blocksparse T=64 zipf ===
+
+== bench_blocksparse  dist=zipf  T=64  K=4  E=64  d=2048  d_ffn=8192 ==
+
+   expert load: min=0 max=40 mean=4.0 imbalance=10.00x
+
+   correctness   max|ref - blocksparse| = 9.9182e-05  (sample=64 rows)
+
+   variant            time (ms)   throughput (TFLOPS)   ratio vs packed
+   packed cuBLAS         1.597           5.38               1.000x
+   blocksparse naive     4.554           1.89               0.351x
+
+   memory: packed buffer materialization saved by blocksparse:
+      1.00 MB write + 1.00 MB read = 2.00 MB / iteration
+
+
+=== blocksparse T=256 zipf ===
+
+== bench_blocksparse  dist=zipf  T=256  K=4  E=64  d=2048  d_ffn=8192 ==
+
+   expert load: min=2 max=150 mean=16.0 imbalance=9.38x
+
+   correctness   max|ref - blocksparse| = 9.1553e-05  (sample=64 rows)
+
+   variant            time (ms)   throughput (TFLOPS)   ratio vs packed
+   packed cuBLAS         1.999          17.18               1.000x
+   blocksparse naive    14.640           2.35               0.137x
+
+   memory: packed buffer materialization saved by blocksparse:
+      4.00 MB write + 4.00 MB read = 8.00 MB / iteration
+
+
+=== blocksparse T=2048 zipf ===
+
+== bench_blocksparse  dist=zipf  T=2048  K=4  E=64  d=2048  d_ffn=8192 ==
+
+   expert load: min=23 max=1294 mean=128.0 imbalance=10.11x
+
+   correctness   max|ref - blocksparse| = 9.1553e-05  (sample=64 rows)
+
+   variant            time (ms)   throughput (TFLOPS)   ratio vs packed
+   packed cuBLAS         3.424          80.29               1.000x
+   blocksparse naive   106.842           2.57               0.032x
+
+   memory: packed buffer materialization saved by blocksparse:
+      32.00 MB write + 32.00 MB read = 64.00 MB / iteration
+
+
+
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/feiyang2/main/ap-LHUJH90vYOzuFYQhB8c9FT

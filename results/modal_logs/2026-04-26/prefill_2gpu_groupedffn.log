@@ -1,0 +1,485 @@
+✓ Initialized. View run at 
+https://modal.com/apps/feiyang2/main/ap-2N1vjZ7xbFp93e5IQDBEPf
+✓ Created objects.
+├── 🔨 Created mount /tmp/modal_bench_nomounts_grouped.py
+├── 🔨 Created mount /home/steven/project/15618-final
+├── 🔨 Created function bench_real_1gpu.
+├── 🔨 Created function bench_real_2gpu.
+├── 🔨 Created function bench_1gpu.
+├── 🔨 Created function bench_2gpu.
+├── 🔨 Created function bench_4gpu.
+└── 🔨 Created function bench_8gpu.
+Launching prefill on 2x A100 (strategy=all) ...
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.4.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+GPUs (2 requested):
+0, NVIDIA A100-SXM4-40GB, 40960 MiB
+1, NVIDIA A100-SXM4-40GB, 40960 MiB
+
+Build OK
+
+=== prefill uniform  naive baseline (atomic + serial) ===
+
+== bench_prefill  strategy=atomic  prefix=syn_uniform_T2048_N32  n_gpus=2  overlap=0  chunks=1  ffn=cublas ==
+
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-round averages:
+    scatter:      1.144 ms  ( 18.4%)
+    dispatch:     0.221 ms  (  3.5%)  [AllGather + AllToAll-V]
+    FFN:          4.666 ms  ( 75.0%)
+    combine:      0.188 ms  (  3.0%)  [AllToAll-V reverse]
+    ─────────────────────────────────
+    round:        6.219 ms
+
+  Full prefill (32 rounds):
+    total:      211.826 ms
+    throughput: 151.1 rounds/s
+    avg round:     6.620 ms  (from total / N)
+
+  EP overhead (scatter+dispatch+combine): 1.553 ms (25.0% of round)
+  FFN fraction: 75.0%
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526915e+02   L2 = 12.356839
+
+
+=== prefill uniform  + warp gather (radix sort + warp-per-row) ===
+
+== bench_prefill  strategy=warp  prefix=syn_uniform_T2048_N32  n_gpus=2  overlap=0  chunks=1  ffn=cublas ==
+
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-round averages:
+    scatter:      0.133 ms  (  2.5%)
+    dispatch:     0.215 ms  (  4.1%)  [AllGather + AllToAll-V]
+    FFN:          4.671 ms  ( 89.7%)
+    combine:      0.190 ms  (  3.7%)  [AllToAll-V reverse]
+    ─────────────────────────────────
+    round:        5.208 ms
+
+  Full prefill (32 rounds):
+    total:      179.485 ms
+    throughput: 178.3 rounds/s
+    avg round:     5.609 ms  (from total / N)
+
+  EP overhead (scatter+dispatch+combine): 0.537 ms (10.3% of round)
+  FFN fraction: 89.7%
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526915e+02   L2 = 12.356839
+
+
+=== prefill uniform  + uint4 (vectorized gather) ===
+
+== bench_prefill  strategy=vec  prefix=syn_uniform_T2048_N32  n_gpus=2  overlap=0  chunks=1  ffn=cublas ==
+
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-round averages:
+    scatter:      0.130 ms  (  2.5%)
+    dispatch:     0.215 ms  (  4.1%)  [AllGather + AllToAll-V]
+    FFN:          4.658 ms  ( 89.6%)
+    combine:      0.193 ms  (  3.7%)  [AllToAll-V reverse]
+    ─────────────────────────────────
+    round:        5.196 ms
+
+  Full prefill (32 rounds):
+    total:      177.941 ms
+    throughput: 179.8 rounds/s
+    avg round:     5.561 ms  (from total / N)
+
+  EP overhead (scatter+dispatch+combine): 0.538 ms (10.4% of round)
+  FFN fraction: 89.6%
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526915e+02   L2 = 12.356839
+
+
+=== prefill uniform  + csort (counting sort, replace radix + bounds) ===
+
+== bench_prefill  strategy=csort  prefix=syn_uniform_T2048_N32  n_gpus=2  overlap=0  chunks=1  ffn=cublas ==
+
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-round averages:
+    scatter:      0.132 ms  (  2.5%)
+    dispatch:     0.204 ms  (  3.9%)  [AllGather + AllToAll-V]
+    FFN:          4.657 ms  ( 89.7%)
+    combine:      0.197 ms  (  3.8%)  [AllToAll-V reverse]
+    ─────────────────────────────────
+    round:        5.190 ms
+
+  Full prefill (32 rounds):
+    total:      178.403 ms
+    throughput: 179.4 rounds/s
+    avg round:     5.575 ms  (from total / N)
+
+  EP overhead (scatter+dispatch+combine): 0.533 ms (10.3% of round)
+  FFN fraction: 89.7%
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526915e+02   L2 = 12.356839
+
+
+=== prefill uniform  + overlap (2-stream comm/compute) ===
+
+== bench_prefill  strategy=csort  prefix=syn_uniform_T2048_N32  n_gpus=2  overlap=1  chunks=1  ffn=cublas ==
+
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-stage breakdown not measured in overlap mode
+  (sub-stage timers would force host syncs that defeat pipelining).
+
+  Full prefill (32 rounds):
+    total:      167.138 ms
+    throughput: 191.5 rounds/s
+    avg round:     5.223 ms  (from total / N)
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526915e+02   L2 = 12.356839
+
+
+=== prefill uniform  + chunked dispatch K=2 (1F1B intra-round) ===
+
+== bench_prefill  strategy=csort  prefix=syn_uniform_T2048_N32  n_gpus=2  overlap=1  chunks=2  ffn=cublas ==
+
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-stage breakdown not measured in overlap mode
+  (sub-stage timers would force host syncs that defeat pipelining).
+
+  Full prefill (32 rounds):
+    total:      171.978 ms
+    throughput: 186.1 rounds/s
+    avg round:     5.374 ms  (from total / N)
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526915e+02   L2 = 12.356839
+
+
+=== prefill uniform  + chunked dispatch K=4 ===
+
+== bench_prefill  strategy=csort  prefix=syn_uniform_T2048_N32  n_gpus=2  overlap=1  chunks=4  ffn=cublas ==
+
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-stage breakdown not measured in overlap mode
+  (sub-stage timers would force host syncs that defeat pipelining).
+
+  Full prefill (32 rounds):
+    total:      178.867 ms
+    throughput: 178.9 rounds/s
+    avg round:     5.590 ms  (from total / N)
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526915e+02   L2 = 12.356839
+
+
+=== prefill uniform  + grouped FFN (CUTLASS GroupedGemm, replaces per-expert hgemm loop) ===
+
+== bench_prefill  strategy=csort  prefix=syn_uniform_T2048_N32  n_gpus=2  overlap=1  chunks=1  ffn=grouped ==
+
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_embeddings.npy             shape=(2048,2048) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_assignments.npy            shape=(65536,4) dtype=<i4
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+[npy] results/syn_uniform_T2048_N32_weights.npy                shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-stage breakdown not measured in overlap mode
+  (sub-stage timers would force host syncs that defeat pipelining).
+
+  Full prefill (32 rounds):
+    total:      115.547 ms
+    throughput: 276.9 rounds/s
+    avg round:     3.611 ms  (from total / N)
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526883e+02   L2 = 12.356711
+
+
+=== prefill zipf  naive baseline (atomic + serial) ===
+
+== bench_prefill  strategy=atomic  prefix=syn_zipf_T2048_N32  n_gpus=2  overlap=0  chunks=1  ffn=cublas ==
+
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-round averages:
+    scatter:      1.148 ms  ( 18.1%)
+    dispatch:     0.225 ms  (  3.5%)  [AllGather + AllToAll-V]
+    FFN:          4.779 ms  ( 75.3%)
+    combine:      0.190 ms  (  3.0%)  [AllToAll-V reverse]
+    ─────────────────────────────────
+    round:        6.343 ms
+
+  Full prefill (32 rounds):
+    total:      235.110 ms
+    throughput: 136.1 rounds/s
+    avg round:     7.347 ms  (from total / N)
+
+  EP overhead (scatter+dispatch+combine): 1.564 ms (24.7% of round)
+  FFN fraction: 75.3%
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526193e+02   L2 = 12.353920
+
+
+=== prefill zipf  + warp gather (radix sort + warp-per-row) ===
+
+== bench_prefill  strategy=warp  prefix=syn_zipf_T2048_N32  n_gpus=2  overlap=0  chunks=1  ffn=cublas ==
+
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-round averages:
+    scatter:      0.138 ms  (  2.6%)
+    dispatch:     0.213 ms  (  4.0%)  [AllGather + AllToAll-V]
+    FFN:          4.784 ms  ( 90.0%)
+    combine:      0.182 ms  (  3.4%)  [AllToAll-V reverse]
+    ─────────────────────────────────
+    round:        5.317 ms
+
+  Full prefill (32 rounds):
+    total:      202.029 ms
+    throughput: 158.4 rounds/s
+    avg round:     6.313 ms  (from total / N)
+
+  EP overhead (scatter+dispatch+combine): 0.533 ms (10.0% of round)
+  FFN fraction: 90.0%
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526193e+02   L2 = 12.353920
+
+
+=== prefill zipf  + uint4 (vectorized gather) ===
+
+== bench_prefill  strategy=vec  prefix=syn_zipf_T2048_N32  n_gpus=2  overlap=0  chunks=1  ffn=cublas ==
+
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-round averages:
+    scatter:      0.128 ms  (  2.4%)
+    dispatch:     0.211 ms  (  4.0%)  [AllGather + AllToAll-V]
+    FFN:          4.787 ms  ( 90.2%)
+    combine:      0.180 ms  (  3.4%)  [AllToAll-V reverse]
+    ─────────────────────────────────
+    round:        5.306 ms
+
+  Full prefill (32 rounds):
+    total:      199.853 ms
+    throughput: 160.1 rounds/s
+    avg round:     6.245 ms  (from total / N)
+
+  EP overhead (scatter+dispatch+combine): 0.519 ms (9.8% of round)
+  FFN fraction: 90.2%
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526193e+02   L2 = 12.353920
+
+
+=== prefill zipf  + csort (counting sort, replace radix + bounds) ===
+
+== bench_prefill  strategy=csort  prefix=syn_zipf_T2048_N32  n_gpus=2  overlap=0  chunks=1  ffn=cublas ==
+
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-round averages:
+    scatter:      0.135 ms  (  2.5%)
+    dispatch:     0.226 ms  (  4.2%)  [AllGather + AllToAll-V]
+    FFN:          4.786 ms  ( 89.6%)
+    combine:      0.196 ms  (  3.7%)  [AllToAll-V reverse]
+    ─────────────────────────────────
+    round:        5.342 ms
+
+  Full prefill (32 rounds):
+    total:      204.137 ms
+    throughput: 156.8 rounds/s
+    avg round:     6.379 ms  (from total / N)
+
+  EP overhead (scatter+dispatch+combine): 0.556 ms (10.4% of round)
+  FFN fraction: 89.6%
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526193e+02   L2 = 12.353920
+
+
+=== prefill zipf  + overlap (2-stream comm/compute) ===
+
+== bench_prefill  strategy=csort  prefix=syn_zipf_T2048_N32  n_gpus=2  overlap=1  chunks=1  ffn=cublas ==
+
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-stage breakdown not measured in overlap mode
+  (sub-stage timers would force host syncs that defeat pipelining).
+
+  Full prefill (32 rounds):
+    total:      190.794 ms
+    throughput: 167.7 rounds/s
+    avg round:     5.962 ms  (from total / N)
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526193e+02   L2 = 12.353920
+
+
+=== prefill zipf  + chunked dispatch K=2 (1F1B intra-round) ===
+
+== bench_prefill  strategy=csort  prefix=syn_zipf_T2048_N32  n_gpus=2  overlap=1  chunks=2  ffn=cublas ==
+
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-stage breakdown not measured in overlap mode
+  (sub-stage timers would force host syncs that defeat pipelining).
+
+  Full prefill (32 rounds):
+    total:      195.756 ms
+    throughput: 163.5 rounds/s
+    avg round:     6.117 ms  (from total / N)
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526193e+02   L2 = 12.353920
+
+
+=== prefill zipf  + chunked dispatch K=4 ===
+
+== bench_prefill  strategy=csort  prefix=syn_zipf_T2048_N32  n_gpus=2  overlap=1  chunks=4  ffn=cublas ==
+
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-stage breakdown not measured in overlap mode
+  (sub-stage timers would force host syncs that defeat pipelining).
+
+  Full prefill (32 rounds):
+    total:      201.917 ms
+    throughput: 158.5 rounds/s
+    avg round:     6.310 ms  (from total / N)
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526193e+02   L2 = 12.353920
+
+
+=== prefill zipf  + grouped FFN (CUTLASS GroupedGemm, replaces per-expert hgemm loop) ===
+
+== bench_prefill  strategy=csort  prefix=syn_zipf_T2048_N32  n_gpus=2  overlap=1  chunks=1  ffn=grouped ==
+
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_embeddings.npy                shape=(2048,2048) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+[npy] results/syn_zipf_T2048_N32_assignments.npy               shape=(65536,4) dtype=<i4
+[npy] results/syn_zipf_T2048_N32_weights.npy                   shape=(65536,4) dtype=<f2
+  warmup=3  repeats=9  rounds=32  (median total over repeats, avg over 2 GPUs)
+
+  Per-stage breakdown not measured in overlap mode
+  (sub-stage timers would force host syncs that defeat pipelining).
+
+  Full prefill (32 rounds):
+    total:      147.842 ms
+    throughput: 216.4 rounds/s
+    avg round:     4.620 ms  (from total / N)
+
+  L2 checksum (round 0 d_combine_recv across all ranks):
+    n_elts = 16777216   sum_sq = 1.526171e+02   L2 = 12.353828
+
+
+
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/feiyang2/main/ap-2N1vjZ7xbFp93e5IQDBEPf
