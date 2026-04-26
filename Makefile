@@ -61,7 +61,8 @@ SCATTER_OBJS := $(patsubst src/%.cu,$(OBJ_DIR)/%.o,$(SCATTER_SRCS))
 
 # Apps (each compiles + links into its own binary).
 APP_SRCS := apps/verify.cu apps/bench_scatter.cu apps/bench_e2e.cu \
-            apps/grouped_gemm_test.cu apps/bench_ep.cu apps/bench_prefill.cu
+            apps/grouped_gemm_test.cu apps/bench_ep.cu apps/bench_prefill.cu \
+            apps/bench_blocksparse.cu
 APP_BINS := $(patsubst apps/%.cu,$(BIN_DIR)/%,$(APP_SRCS))
 
 # ---- default goal ----------------------------------------------------------
@@ -91,6 +92,7 @@ $(BIN_DIR)/bench_ep:           LINK_EXTRA := $(NCCL_LINK)
 $(BIN_DIR)/bench_ep:           EXTRA_INC  := $(NCCL_INC)
 $(BIN_DIR)/bench_prefill:      LINK_EXTRA := $(CUBLAS_LINK) $(NCCL_LINK) $(NVTX_LINK)
 $(BIN_DIR)/bench_prefill:      EXTRA_INC  := $(NCCL_INC)
+$(BIN_DIR)/bench_blocksparse:  LINK_EXTRA := $(CUBLAS_LINK)
 
 $(BIN_DIR)/%: apps/%.cu $(SCATTER_OBJS) $(COMMON_OBJS)
 	$(NVCC) $(NVCCFLAGS) $(EXTRA_INC) $< $(SCATTER_OBJS) $(COMMON_OBJS) $(LINK_EXTRA) -o $@
