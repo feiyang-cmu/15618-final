@@ -114,6 +114,7 @@ struct Config {
     int         warmup    = 2;
     int         repeats   = 5;
     int         overlap   = 0;   // 0 = single-stream serial, 1 = 2-stream comm/compute overlap
+    int         chunks    = 1;   // when overlap=1: 1 = unchunked, K>1 = K-chunk dispatch (1F1B-style)
 };
 
 Config parse(int argc, char** argv) {
@@ -134,6 +135,7 @@ Config parse(int argc, char** argv) {
         else if (k == "warmup")   c.warmup   = std::atoi(v.c_str());
         else if (k == "repeats")  c.repeats  = std::atoi(v.c_str());
         else if (k == "overlap")  c.overlap  = std::atoi(v.c_str());
+        else if (k == "chunks")   c.chunks   = std::atoi(v.c_str());
         else { std::fprintf(stderr, "unknown flag --%s\n", k.c_str()); std::exit(1); }
     }
     if (c.prefix.empty()) {
@@ -294,11 +296,25 @@ void rank_worker(
     }
     CUBLAS_CHECK(cublasSetStream(cublas, s_cmp));
 
-    // Cross-stream events for handoff. Reused per round.
-    cudaEvent_t ev_scatter_done, ev_dispatch_done, ev_ffn_done;
-    MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_scatter_done,  cudaEventDisableTiming));
-    MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_dispatch_done, cudaEventDisableTiming));
-    MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_ffn_done,      cudaEventDisableTiming));
+    // chunks must divide experts_per_gpu evenly when chunked.
+    const int K_CHUNKS = (cfg.overlap && cfg.chunks > 1) ? cfg.chunks : 1;
+    if (K_CHUNKS > 1 && experts_per_gpu % K_CHUNKS != 0) {
+        std::fprintf(stderr,
+            "chunks=%d must divide experts_per_gpu=%d evenly\n",
+            K_CHUNKS, experts_per_gpu);
+        std::exit(1);
+    }
+    const int experts_per_chunk = experts_per_gpu / K_CHUNKS;
+
+    // Cross-stream events for handoff. Per-chunk events when chunked, so
+    // dispatch chunk c+1 can overlap FFN chunk c on different streams.
+    cudaEvent_t ev_scatter_done;
+    MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_scatter_done, cudaEventDisableTiming));
+    std::vector<cudaEvent_t> ev_dispatch_done(K_CHUNKS), ev_ffn_done(K_CHUNKS);
+    for (int c = 0; c < K_CHUNKS; ++c) {
+        MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_dispatch_done[c], cudaEventDisableTiming));
+        MOE_CUDA_CHECK(cudaEventCreateWithFlags(&ev_ffn_done[c],      cudaEventDisableTiming));
+    }
 
     __half alpha_h = __float2half(1.f), beta_h = __float2half(0.f);
 
@@ -306,6 +322,12 @@ void rank_worker(
     std::vector<int32_t> h_all_counts((std::size_t)n_ranks * p.E);
     std::vector<int32_t> h_send_off_tok(n_ranks + 1);  // token offsets in bufs.packed
     std::vector<int32_t> h_recv_off_tok(n_ranks + 1);  // token offsets in d_dispatch_recv
+    // Per-chunk per-rank send/recv counts (only used when K_CHUNKS > 1).
+    // Layout: chunk_send_cnt[c * n_ranks + g] = tokens this rank sends to g for chunk c.
+    std::vector<int32_t> chunk_send_cnt((std::size_t)K_CHUNKS * n_ranks);
+    std::vector<int32_t> chunk_recv_cnt((std::size_t)K_CHUNKS * n_ranks);
+    std::vector<int32_t> chunk_send_off((std::size_t)K_CHUNKS * n_ranks);  // offset within sender's bufs.packed
+    std::vector<int32_t> chunk_recv_off((std::size_t)K_CHUNKS * n_ranks);  // offset within d_dispatch_recv
 
     // ── Lambda: run one full round ────────────────────────────────────────────
     // Two paths:
@@ -323,12 +345,12 @@ void rank_worker(
         float*   d_wts  = d_wts_local  + (std::size_t)round_idx * TK_local;
 
         if (cfg.overlap) {
-            // ── OVERLAP path ────────────────────────────────────────────────
+            // ── OVERLAP path (with optional K-chunk 1F1B) ───────────────────
             // Stage 1: scatter on s_cmp
             scatter->run(d_emb_local, d_asgn, d_wts, bufs, p, s_cmp);
             MOE_CUDA_CHECK(cudaEventRecord(ev_scatter_done, s_cmp));
 
-            // Stage 2 (s_com): AllGather + sync + offsets + AllToAll-V dispatch
+            // Stage 2a (s_com): AllGather + sync (always one shot — small)
             MOE_CUDA_CHECK(cudaStreamWaitEvent(s_com, ev_scatter_done, 0));
             NCCL_CHECK(ncclAllGather(
                 bufs.expert_count, d_all_counts, p.E, ncclInt32, comm, s_com));
@@ -337,6 +359,9 @@ void rank_worker(
                 (std::size_t)n_ranks * p.E * 4, cudaMemcpyDeviceToHost, s_com));
             MOE_CUDA_CHECK(cudaStreamSynchronize(s_com));
 
+            // 2b. Compute global per-pair offsets (used for both unchunked
+            //     and chunked path; chunked path further splits these by
+            //     experts_per_chunk).
             h_send_off_tok[0] = 0;
             for (int g = 0; g < n_ranks; ++g) {
                 int32_t s = 0;
@@ -352,77 +377,147 @@ void rank_worker(
                 h_recv_off_tok[g + 1] = h_recv_off_tok[g] + s;
             }
 
-            NCCL_CHECK(ncclGroupStart());
-            for (int g = 0; g < n_ranks; ++g) {
-                std::size_t send_cnt =
-                    (std::size_t)(h_send_off_tok[g + 1] - h_send_off_tok[g]) * d_model;
-                std::size_t recv_cnt =
-                    (std::size_t)(h_recv_off_tok[g + 1] - h_recv_off_tok[g]) * d_model;
-                if (send_cnt > 0) {
-                    NCCL_CHECK(ncclSend(
-                        bufs.packed + (std::size_t)h_send_off_tok[g] * d_model,
-                        send_cnt, ncclHalf, g, comm, s_com));
+            // 2c. When chunked, derive per-(chunk, rank) send/recv counts +
+            //     offsets. The slice for chunk c sent to rank r covers r's
+            //     experts [c*experts_per_chunk, (c+1)*experts_per_chunk).
+            if (K_CHUNKS > 1) {
+                for (int c = 0; c < K_CHUNKS; ++c) {
+                    for (int g = 0; g < n_ranks; ++g) {
+                        int32_t scnt = 0, rcnt = 0;
+                        // Send: this rank's tokens for g's experts in chunk c
+                        int e_lo_send = g * experts_per_gpu + c * experts_per_chunk;
+                        int e_hi_send = e_lo_send + experts_per_chunk;
+                        for (int e = e_lo_send; e < e_hi_send; ++e)
+                            scnt += h_all_counts[(std::size_t)rank * p.E + e];
+                        // Recv: g's tokens for our experts in chunk c
+                        int e_lo_recv = rank * experts_per_gpu + c * experts_per_chunk;
+                        int e_hi_recv = e_lo_recv + experts_per_chunk;
+                        for (int e = e_lo_recv; e < e_hi_recv; ++e)
+                            rcnt += h_all_counts[(std::size_t)g * p.E + e];
+                        chunk_send_cnt[c * n_ranks + g] = scnt;
+                        chunk_recv_cnt[c * n_ranks + g] = rcnt;
+                    }
                 }
-                if (recv_cnt > 0) {
-                    NCCL_CHECK(ncclRecv(
-                        d_dispatch_recv + (std::size_t)h_recv_off_tok[g] * d_model,
-                        recv_cnt, ncclHalf, g, comm, s_com));
-                }
-            }
-            NCCL_CHECK(ncclGroupEnd());
-            MOE_CUDA_CHECK(cudaEventRecord(ev_dispatch_done, s_com));
-
-            // Stage 3 (s_cmp): FFN — wait for dispatch
-            MOE_CUDA_CHECK(cudaStreamWaitEvent(s_cmp, ev_dispatch_done, 0));
-            std::size_t curr_tok = 0;
-            for (int g = 0; g < n_ranks; ++g) {
-                for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
-                    int e_global = rank * experts_per_gpu + e_local;
-                    int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
-                    if (cnt == 0) continue;
-
-                    const __half* A  = d_dispatch_recv + curr_tok * d_model;
-                    const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
-                    const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
-                    __half* mid      = d_ffn_tmp    + curr_tok * p.d_ffn;
-                    __half* eout     = d_expert_out + curr_tok * d_model;
-
-                    CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                        p.d_ffn, cnt, d_model, &alpha_h,
-                        B1, p.d_ffn, A, d_model,
-                        &beta_h, mid, p.d_ffn));
-                    CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                        d_model, cnt, p.d_ffn, &alpha_h,
-                        B2, d_model, mid, p.d_ffn,
-                        &beta_h, eout, d_model));
-
-                    curr_tok += cnt;
+                // Compute offsets within each rank's bufs.packed (send) and
+                // d_dispatch_recv (recv). For rank r: offset starts at
+                // h_send_off_tok[g] (which is the cumulative offset for the
+                // entire pre-r block) and within that, chunk c starts after
+                // chunks 0..c-1.
+                for (int g = 0; g < n_ranks; ++g) {
+                    int32_t s_off = h_send_off_tok[g];
+                    int32_t r_off = h_recv_off_tok[g];
+                    for (int c = 0; c < K_CHUNKS; ++c) {
+                        chunk_send_off[c * n_ranks + g] = s_off;
+                        chunk_recv_off[c * n_ranks + g] = r_off;
+                        s_off += chunk_send_cnt[c * n_ranks + g];
+                        r_off += chunk_recv_cnt[c * n_ranks + g];
+                    }
                 }
             }
-            MOE_CUDA_CHECK(cudaEventRecord(ev_ffn_done, s_cmp));
 
-            // Stage 4 (s_com): combine — wait for FFN
-            MOE_CUDA_CHECK(cudaStreamWaitEvent(s_com, ev_ffn_done, 0));
-            NCCL_CHECK(ncclGroupStart());
-            for (int g = 0; g < n_ranks; ++g) {
-                std::size_t send_cnt =
-                    (std::size_t)(h_recv_off_tok[g + 1] - h_recv_off_tok[g]) * d_model;
-                std::size_t recv_cnt =
-                    (std::size_t)(h_send_off_tok[g + 1] - h_send_off_tok[g]) * d_model;
-                if (send_cnt > 0) {
-                    NCCL_CHECK(ncclSend(
-                        d_expert_out + (std::size_t)h_recv_off_tok[g] * d_model,
-                        send_cnt, ncclHalf, g, comm, s_com));
+            // 2d. Per-chunk dispatch + per-chunk FFN + per-chunk combine.
+            //     Unchunked is just K_CHUNKS=1 (single iteration).
+            for (int c = 0; c < K_CHUNKS; ++c) {
+                // ── Dispatch chunk c on s_com ────────────────────────────
+                NCCL_CHECK(ncclGroupStart());
+                for (int g = 0; g < n_ranks; ++g) {
+                    std::size_t send_cnt, recv_cnt;
+                    int32_t send_off, recv_off;
+                    if (K_CHUNKS == 1) {
+                        send_cnt = (std::size_t)(h_send_off_tok[g + 1] - h_send_off_tok[g]) * d_model;
+                        recv_cnt = (std::size_t)(h_recv_off_tok[g + 1] - h_recv_off_tok[g]) * d_model;
+                        send_off = h_send_off_tok[g];
+                        recv_off = h_recv_off_tok[g];
+                    } else {
+                        send_cnt = (std::size_t)chunk_send_cnt[c * n_ranks + g] * d_model;
+                        recv_cnt = (std::size_t)chunk_recv_cnt[c * n_ranks + g] * d_model;
+                        send_off = chunk_send_off[c * n_ranks + g];
+                        recv_off = chunk_recv_off[c * n_ranks + g];
+                    }
+                    if (send_cnt > 0) {
+                        NCCL_CHECK(ncclSend(
+                            bufs.packed + (std::size_t)send_off * d_model,
+                            send_cnt, ncclHalf, g, comm, s_com));
+                    }
+                    if (recv_cnt > 0) {
+                        NCCL_CHECK(ncclRecv(
+                            d_dispatch_recv + (std::size_t)recv_off * d_model,
+                            recv_cnt, ncclHalf, g, comm, s_com));
+                    }
                 }
-                if (recv_cnt > 0) {
-                    NCCL_CHECK(ncclRecv(
-                        d_combine_recv + (std::size_t)h_send_off_tok[g] * d_model,
-                        recv_cnt, ncclHalf, g, comm, s_com));
+                NCCL_CHECK(ncclGroupEnd());
+                MOE_CUDA_CHECK(cudaEventRecord(ev_dispatch_done[c], s_com));
+
+                // ── FFN chunk c on s_cmp ─────────────────────────────────
+                MOE_CUDA_CHECK(cudaStreamWaitEvent(s_cmp, ev_dispatch_done[c], 0));
+                int e_local_lo = c * experts_per_chunk;
+                int e_local_hi = (c + 1) * experts_per_chunk;
+                if (K_CHUNKS == 1) { e_local_lo = 0; e_local_hi = experts_per_gpu; }
+
+                // Walk d_dispatch_recv following the same per-(sender, expert)
+                // order it was written. Skip the (sender, expert) pairs whose
+                // expert is not in this chunk's range.
+                std::size_t curr_tok = 0;
+                for (int g = 0; g < n_ranks; ++g) {
+                    for (int e_local = 0; e_local < experts_per_gpu; ++e_local) {
+                        int e_global = rank * experts_per_gpu + e_local;
+                        int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
+                        if (cnt == 0) continue;
+                        if (e_local < e_local_lo || e_local >= e_local_hi) {
+                            curr_tok += cnt;  // skip — not in this chunk
+                            continue;
+                        }
+                        const __half* A  = d_dispatch_recv + curr_tok * d_model;
+                        const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
+                        const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
+                        __half* mid      = d_ffn_tmp    + curr_tok * p.d_ffn;
+                        __half* eout     = d_expert_out + curr_tok * d_model;
+
+                        CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                            p.d_ffn, cnt, d_model, &alpha_h,
+                            B1, p.d_ffn, A, d_model,
+                            &beta_h, mid, p.d_ffn));
+                        CUBLAS_CHECK(cublasHgemm(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                            d_model, cnt, p.d_ffn, &alpha_h,
+                            B2, d_model, mid, p.d_ffn,
+                            &beta_h, eout, d_model));
+
+                        curr_tok += cnt;
+                    }
                 }
+                MOE_CUDA_CHECK(cudaEventRecord(ev_ffn_done[c], s_cmp));
+
+                // ── Combine chunk c on s_com ─────────────────────────────
+                MOE_CUDA_CHECK(cudaStreamWaitEvent(s_com, ev_ffn_done[c], 0));
+                NCCL_CHECK(ncclGroupStart());
+                for (int g = 0; g < n_ranks; ++g) {
+                    std::size_t send_cnt, recv_cnt;
+                    int32_t send_off_back, recv_off_back;
+                    if (K_CHUNKS == 1) {
+                        send_cnt = (std::size_t)(h_recv_off_tok[g + 1] - h_recv_off_tok[g]) * d_model;
+                        recv_cnt = (std::size_t)(h_send_off_tok[g + 1] - h_send_off_tok[g]) * d_model;
+                        send_off_back = h_recv_off_tok[g];
+                        recv_off_back = h_send_off_tok[g];
+                    } else {
+                        send_cnt = (std::size_t)chunk_recv_cnt[c * n_ranks + g] * d_model;
+                        recv_cnt = (std::size_t)chunk_send_cnt[c * n_ranks + g] * d_model;
+                        send_off_back = chunk_recv_off[c * n_ranks + g];
+                        recv_off_back = chunk_send_off[c * n_ranks + g];
+                    }
+                    if (send_cnt > 0) {
+                        NCCL_CHECK(ncclSend(
+                            d_expert_out + (std::size_t)send_off_back * d_model,
+                            send_cnt, ncclHalf, g, comm, s_com));
+                    }
+                    if (recv_cnt > 0) {
+                        NCCL_CHECK(ncclRecv(
+                            d_combine_recv + (std::size_t)recv_off_back * d_model,
+                            recv_cnt, ncclHalf, g, comm, s_com));
+                    }
+                }
+                NCCL_CHECK(ncclGroupEnd());
             }
-            NCCL_CHECK(ncclGroupEnd());
-            // No sync here — let next round queue work onto the streams.
-            // The outer rep loop syncs once at the end.
+            // No sync here — outer rep loop syncs once at the end.
             return;
         }
 
@@ -604,8 +699,10 @@ void rank_worker(
     cudaFree(d_dispatch_recv); cudaFree(d_combine_recv);
     cudaFree(d_W1); cudaFree(d_W2); cudaFree(d_ffn_tmp); cudaFree(d_expert_out);
     cudaEventDestroy(ev_scatter_done);
-    cudaEventDestroy(ev_dispatch_done);
-    cudaEventDestroy(ev_ffn_done);
+    for (int c = 0; c < K_CHUNKS; ++c) {
+        cudaEventDestroy(ev_dispatch_done[c]);
+        cudaEventDestroy(ev_ffn_done[c]);
+    }
     cudaStreamDestroy(s_cmp);
     if (cfg.overlap) cudaStreamDestroy(s_com);
 }
@@ -629,8 +726,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("\n== bench_prefill  strategy=%s  prefix=%s  n_gpus=%d  overlap=%d ==\n\n",
-                cfg.strategy.c_str(), cfg.prefix.c_str(), n_ranks, cfg.overlap);
+    std::printf("\n== bench_prefill  strategy=%s  prefix=%s  n_gpus=%d  overlap=%d  chunks=%d ==\n\n",
+                cfg.strategy.c_str(), cfg.prefix.c_str(), n_ranks, cfg.overlap, cfg.chunks);
 
     // ── NCCL init ─────────────────────────────────────────────────────────────
     std::vector<ncclComm_t> comms(n_ranks);
