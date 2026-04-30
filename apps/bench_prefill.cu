@@ -201,6 +201,25 @@ static void gg_run(GroupedGemmCtx& ctx, cudaStream_t stream) {
     }
 }
 
+// ── L2 prefetch kernel ────────────────────────────────────────────────────────
+// Issues one prefetch.global.L2 per 128-byte cache line (64 fp16 elements).
+// Launched on the compute stream so the hardware can fetch while the current
+// GEMM runs, hiding the cold-miss latency for the next expert's weight tile.
+
+__global__ void prefetch_l2_kernel(const __half* __restrict__ ptr, std::size_t n_fp16) {
+    std::size_t stride = (std::size_t)blockDim.x * gridDim.x;
+    for (std::size_t i = (std::size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i * 64 < n_fp16; i += stride)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr + i * 64) : "memory");
+}
+
+static void prefetch_weights_l2(const __half* ptr, std::size_t n_fp16, cudaStream_t s) {
+    if (n_fp16 == 0) return;
+    int threads = 256;
+    int blocks  = (int)std::min((n_fp16 + 63) / 64 / threads + 1, (std::size_t)32);
+    prefetch_l2_kernel<<<blocks, threads, 0, s>>>(ptr, n_fp16);
+}
+
 // ── Barrier for N threads ─────────────────────────────────────────────────────
 
 struct BarrierN {
@@ -255,6 +274,7 @@ struct Config {
     int         overlap   = 0;   // 0 = single-stream serial, 1 = 2-stream comm/compute overlap
     int         chunks    = 1;   // when overlap=1: 1 = unchunked, K>1 = K-chunk dispatch (1F1B-style)
     std::string ffn       = "cublas";  // cublas (per-expert hgemm loop) | grouped (CUTLASS GroupedGemm)
+    int         prefetch  = 0;        // 1 = L2-prefetch next expert's weights before current GEMM
 };
 
 Config parse(int argc, char** argv) {
@@ -277,6 +297,7 @@ Config parse(int argc, char** argv) {
         else if (k == "overlap")  c.overlap  = std::atoi(v.c_str());
         else if (k == "chunks")   c.chunks   = std::atoi(v.c_str());
         else if (k == "ffn")      c.ffn      = v;
+        else if (k == "prefetch") c.prefetch = std::atoi(v.c_str());
         else { std::fprintf(stderr, "unknown flag --%s\n", k.c_str()); std::exit(1); }
     }
     if (c.prefix.empty()) {
@@ -672,6 +693,13 @@ void rank_worker(
                             if (e_local < e_local_lo || e_local >= e_local_hi) {
                                 curr_tok += cnt; continue;
                             }
+                            // Prefetch next expert's weights before this GEMM so the
+                            // hardware can fetch while Tensor Cores run current expert.
+                            if (cfg.prefetch && g == 0 && e_local + 1 < experts_per_gpu) {
+                                std::size_t w_elts = (std::size_t)d_model * p.d_ffn;
+                                prefetch_weights_l2(d_W1 + (e_local + 1) * w_elts, w_elts, s_cmp);
+                                prefetch_weights_l2(d_W2 + (e_local + 1) * w_elts, w_elts, s_cmp);
+                            }
                             const __half* A  = d_dispatch_recv + curr_tok * d_model;
                             const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
                             const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
@@ -830,6 +858,11 @@ void rank_worker(
                     int cnt = h_all_counts[(std::size_t)g * p.E + e_global];
                     if (cnt == 0) continue;
 
+                    if (cfg.prefetch && g == 0 && e_local + 1 < experts_per_gpu) {
+                        std::size_t w_elts = (std::size_t)d_model * p.d_ffn;
+                        prefetch_weights_l2(d_W1 + (e_local + 1) * w_elts, w_elts, s_cmp);
+                        prefetch_weights_l2(d_W2 + (e_local + 1) * w_elts, w_elts, s_cmp);
+                    }
                     const __half* A  = d_dispatch_recv + curr_tok * d_model;
                     const __half* B1 = d_W1 + (std::size_t)e_local * d_model * p.d_ffn;
                     const __half* B2 = d_W2 + (std::size_t)e_local * p.d_ffn * d_model;
@@ -979,9 +1012,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("\n== bench_prefill  strategy=%s  prefix=%s  n_gpus=%d  overlap=%d  chunks=%d  ffn=%s ==\n\n",
+    std::printf("\n== bench_prefill  strategy=%s  prefix=%s  n_gpus=%d  overlap=%d  chunks=%d  ffn=%s  prefetch=%d ==\n\n",
                 cfg.strategy.c_str(), cfg.prefix.c_str(), n_ranks, cfg.overlap,
-                cfg.chunks, cfg.ffn.c_str());
+                cfg.chunks, cfg.ffn.c_str(), cfg.prefetch);
 
     // ── NCCL init ─────────────────────────────────────────────────────────────
     std::vector<ncclComm_t> comms(n_ranks);
